@@ -1,9 +1,14 @@
+import { compare } from "bcrypt";
 import { AppDataSource } from "../config/database";
 import { UserDto } from "../dto/userDto";
 import { User } from "../entities/userentity";
+import jwt from "jsonwebtoken";
+import { Token } from "../entities/tokenEntity";
+import { TokenService } from "./tokenSertvices";
 
 export class UserService {
   private userRepo = AppDataSource.getRepository(User);
+  private tokenService = new TokenService();
 
   async create(userDto: UserDto): Promise<User> {
     const user = this.userRepo.create(userDto);
@@ -35,5 +40,44 @@ export class UserService {
   async delete(id: number): Promise<number> {
     await this.userRepo.delete(id);
     return id;
+  }
+
+  async login(email: string, password: string) {
+    const user = await this.userRepo.findOneBy({ email: email });
+
+    if (!user) {
+      return "Email not found";
+    }
+
+    const checkpass = await compare(password, user.password);
+
+    if (!checkpass) {
+      return "Invalid Credentials";
+    }
+
+    const newToken = jwt.sign(
+      {
+        data: user.id,
+      },
+      "secrets",
+      { expiresIn: "1h" }
+    );
+
+    if (!newToken) {
+      return { message: "login Failed" };
+    }
+    // const saveToken = await this.tokenRepo.save({
+    //   token: newToken,
+    //   userId: user.id,
+    // });
+
+    const saveToken = this.tokenService.create(newToken, user.id);
+
+    if (!saveToken) {
+      return { message: "login Failed" };
+    }
+
+    
+    return { message: "Login Successfull", email };
   }
 }

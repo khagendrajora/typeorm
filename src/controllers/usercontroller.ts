@@ -53,3 +53,13 @@ export const deleteUser = async (req: Request, res: Response) => {
     res.status(500).json({ message: error.message });
   }
 };
+
+export const login = async (req: Request, res: Response) => {
+  try {
+    const { email, password } = req.body;
+
+    const login = await userService.login(email, password);
+  } catch (error: any) {
+    res.status(500).json({ message: error.message });
+  }
+};
