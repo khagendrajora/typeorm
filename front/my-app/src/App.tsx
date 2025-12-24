@@ -17,6 +17,7 @@ function App() {
   // const endMarkerRef = useRef<any>(null);
 
   const routePolylineRef = useRef<any>(null);
+  const connectorPolylinesRef = useRef<any[]>([]);
 
   const [markers, setMarkers] = useState([
     {
@@ -41,6 +42,7 @@ function App() {
 
   const [checkPoints, setCheckPoints] = useState<any>([]);
   const markersRef = useRef<any[]>([]);
+  const [distances, setDistances] = useState<{ from: number; to: number; distance: number }[]>([]);
 
   // useEffect(() => {
   //   buttonRef.current = button;
@@ -112,12 +114,145 @@ function App() {
 
         markersRef.current.push(marker);
 
+        // Check if marker is on road and draw connector polyline if not
+        snapToRoadAndDrawConnector(pos, marker);
+
         return newPoints;
       });
     });
   };
 
+  // Function to snap a point to the nearest road and draw a connector polyline
+  const snapToRoadAndDrawConnector = async (originalPos: any, marker: any) => {
+    const apiKey = "11e685bcf1e448a8ab56b428e61dfad4";
+    
+    // Use Geoapify's Snap to Roads API (or routing API with single point)
+    const url = `https://api.geoapify.com/v1/routing?waypoints=${originalPos.lat},${originalPos.lng}|${originalPos.lat},${originalPos.lng}&mode=drive&apiKey=${apiKey}`;
+
+    try {
+      const response = await fetch(url);
+      const data = await response.json();
+
+      if (data.features && data.features[0]?.geometry?.coordinates) {
+        const coordsArray = data.features[0].geometry.coordinates;
+        
+        // Get the snapped point (first point from the route)
+        if (coordsArray.length > 0 && coordsArray[0].length > 0) {
+          const snappedPoint = {
+            lat: Number(coordsArray[0][0][1]),
+            lng: Number(coordsArray[0][0][0]),
+          };
+
+          // Calculate distance between original and snapped point
+          const distance = calculateDistance(originalPos, snappedPoint);
+
+          // If distance is greater than threshold (e.g., 5 meters), marker is off-road
+          if (distance > 5) {
+            // Draw a polyline from marker to road
+            const connectorPolyline = new mapsApi.current.Polyline({
+              path: [originalPos, snappedPoint],
+              map: mapInstance.current,
+              strokeColor: "#FF0000", // Red color for off-road connector
+              strokeWeight: 3,
+              strokeOpacity: 0.8,
+              icons: [
+                {
+                  icon: {
+                    path: "M 0,-1 0,1",
+                    strokeOpacity: 1,
+                    scale: 3,
+                  },
+                  offset: "0",
+                  repeat: "15px",
+                },
+              ],
+            });
+
+            // Store reference to the connector polyline with the marker
+            marker.connectorPolyline = connectorPolyline;
+            connectorPolylinesRef.current.push(connectorPolyline);
+
+            // Optionally add a small marker at the road snap point
+            const roadMarker = new mapsApi.current.Marker({
+              position: snappedPoint,
+              map: mapInstance.current,
+              icon: {
+                path: mapsApi.current.SymbolPath.CIRCLE,
+                scale: 6,
+                fillColor: "#00FF00",
+                fillOpacity: 1,
+                strokeColor: "#006600",
+                strokeWeight: 2,
+              },
+              title: "Road connection point",
+            });
+
+            marker.roadMarker = roadMarker;
+          }
+        }
+      }
+    } catch (error) {
+      console.log("Error snapping to road:", error);
+    }
+  };
+
+  // Helper function to calculate distance between two points in meters
+  const calculateDistance = (pos1: any, pos2: any) => {
+    const R = 6371000; // Earth's radius in meters
+    const dLat = ((pos2.lat - pos1.lat) * Math.PI) / 180;
+    const dLng = ((pos2.lng - pos1.lng) * Math.PI) / 180;
+    const a =
+      Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+      Math.cos((pos1.lat * Math.PI) / 180) *
+        Math.cos((pos2.lat * Math.PI) / 180) *
+        Math.sin(dLng / 2) *
+        Math.sin(dLng / 2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    return R * c;
+  };
+
+  // Calculate all pairwise distances between checkpoints
+  const calculateAllDistances = () => {
+    if (checkPoints.length < 2) {
+      setDistances([]);
+      return;
+    }
+
+    const newDistances: { from: number; to: number; distance: number }[] = [];
+    
+    for (let i = 0; i < checkPoints.length; i++) {
+      for (let j = i + 1; j < checkPoints.length; j++) {
+        const dist = calculateDistance(checkPoints[i], checkPoints[j]);
+        newDistances.push({
+          from: i + 1,
+          to: j + 1,
+          distance: Math.round(dist * 100) / 100, // Round to 2 decimal places
+        });
+      }
+    }
+    
+    setDistances(newDistances);
+  };
+
+  // Update distances whenever checkpoints change
+  useEffect(() => {
+    calculateAllDistances();
+  }, [checkPoints]);
+
   const removePoint = (marker: any, point: any) => {
+    // Remove connector polyline if exists
+    if (marker.connectorPolyline) {
+      marker.connectorPolyline.setMap(null);
+      connectorPolylinesRef.current = connectorPolylinesRef.current.filter(
+        (p) => p !== marker.connectorPolyline
+      );
+    }
+
+    // Remove road marker if exists
+    if (marker.roadMarker) {
+      marker.roadMarker.setMap(null);
+    }
+
     // Remove marker from map
     marker.setMap(null);
 
@@ -274,9 +409,23 @@ function App() {
 
   const reset = () => {
     setCheckPoints([]);
+    setDistances([]);
 
-    markersRef.current.forEach((m) => m.setMap(null));
+    markersRef.current.forEach((m) => {
+      m.setMap(null);
+      // Also remove connector polylines and road markers
+      if (m.connectorPolyline) {
+        m.connectorPolyline.setMap(null);
+      }
+      if (m.roadMarker) {
+        m.roadMarker.setMap(null);
+      }
+    });
     markersRef.current = [];
+
+    // Clear all connector polylines
+    connectorPolylinesRef.current.forEach((p) => p.setMap(null));
+    connectorPolylinesRef.current = [];
 
     if (routePolylineRef.current) {
       routePolylineRef.current.setMap(null);
@@ -299,6 +448,44 @@ function App() {
           Reset
         </button>
       </div>
+
+      {/* Distance Table */}
+      {distances.length > 0 && (
+        <div style={{ marginTop: "20px", padding: "10px" }}>
+          <h3>Distances Between Markers</h3>
+          <table style={{ borderCollapse: "collapse", width: "100%", maxWidth: "400px" }}>
+            <thead>
+              <tr>
+                <th style={{ border: "1px solid #ddd", padding: "8px", backgroundColor: "#f2f2f2" }}>From</th>
+                <th style={{ border: "1px solid #ddd", padding: "8px", backgroundColor: "#f2f2f2" }}>To</th>
+                <th style={{ border: "1px solid #ddd", padding: "8px", backgroundColor: "#f2f2f2" }}>Distance</th>
+              </tr>
+            </thead>
+            <tbody>
+              {distances.map((d, index) => (
+                <tr key={index}>
+                  <td style={{ border: "1px solid #ddd", padding: "8px", textAlign: "center" }}>Point {d.from}</td>
+                  <td style={{ border: "1px solid #ddd", padding: "8px", textAlign: "center" }}>Point {d.to}</td>
+                  <td style={{ border: "1px solid #ddd", padding: "8px", textAlign: "center" }}>
+                    {d.distance >= 1000 
+                      ? `${(d.distance / 1000).toFixed(2)} km` 
+                      : `${d.distance.toFixed(2)} m`}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {checkPoints.length >= 2 && (
+            <p style={{ marginTop: "10px", fontWeight: "bold" }}>
+              Total straight-line distance: {
+                distances.reduce((sum, d) => sum + d.distance, 0) >= 1000
+                  ? `${(distances.reduce((sum, d) => sum + d.distance, 0) / 1000).toFixed(2)} km`
+                  : `${distances.reduce((sum, d) => sum + d.distance, 0).toFixed(2)} m`
+              }
+            </p>
+          )}
+        </div>
+      )}
     </>
   );
 }
