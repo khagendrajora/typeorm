@@ -1,305 +1,134 @@
-import { useEffect, useRef, useState } from "react";
-import "./App.css";
-import { loadGoogleMaps } from "./google-map-loader";
+import React, { useState, useMemo } from "react";
+import { MapContainer, TileLayer, Marker, Polyline, Popup, useMapEvents } from "react-leaflet";
+import L from "leaflet";
+import * as turf from "@turf/turf";
+import "leaflet/dist/leaflet.css";
+
+// Fix for default Leaflet icon missing in React builds
+import icon from 'leaflet/dist/images/marker-icon.png';
+import iconShadow from 'leaflet/dist/images/marker-shadow.png';
+let DefaultIcon = L.icon({
+    iconUrl: icon,
+    shadowUrl: iconShadow,
+    iconSize: [25, 41],
+    iconAnchor: [12, 41]
+});
+L.Marker.prototype.options.icon = DefaultIcon;
 
 function App() {
-  const mapRef = useRef<HTMLDivElement>(null);
-  const mapInstance = useRef<any>(null);
-  const mapsApi = useRef<any>(null);
+  const [checkPoints, setCheckPoints] = useState<[number, number][]>([]);
+  const [routePath, setRoutePath] = useState<[number, number][]>([]);
+  const [midpoints, setMidpoints] = useState<any[]>([]);
 
-  // const [button, setButton] = useState<"start" | "end" | "">("");
-  // const buttonRef = useRef(button);
-
-  // const [startPoint, setStartPoint] = useState<any>(null);
-  // const [endPoint, setEndPoint] = useState<any>(null);
-
-  // const startMarkerRef = useRef<any>(null);
-  // const endMarkerRef = useRef<any>(null);
-
-  const routePolylineRef = useRef<any>(null);
-
-  const [markers, setMarkers] = useState([
-    {
-      coords: { lat: 27.696354, lng: 85.336537 },
-      IconImage:
-        "https://developers.google.com/maps/documentation/javascript/examples/full/images/beachflag.png",
-      title: "location 1",
-    },
-    {
-      coords: { lat: 27.696662677926415, lng: 85.33526643980764 },
-      IconImage:
-        "https://developers.google.com/maps/documentation/javascript/examples/full/images/beachflag.png",
-      title: "location 2",
-    },
-    {
-      coords: { lat: 27.696865502368286, lng: 85.33607831974011 },
-      IconImage:
-        "https://developers.google.com/maps/documentation/javascript/examples/full/images/beachflag.png",
-      title: "location 3",
-    },
-  ]);
-
-  const [checkPoints, setCheckPoints] = useState<any>([]);
-  const markersRef = useRef<any[]>([]);
-
-  // useEffect(() => {
-  //   buttonRef.current = button;
-  // }, [button]);
-
-  useEffect(() => {
-    loadGoogleMaps("AIzaSyBQkos0nrQdixBBmGf06TBjXgjtFcShzzU").then((maps) => {
-      mapsApi.current = maps;
-      mapInstance.current = new maps.Map(mapRef.current!, {
-        center: { lat: 28.90258, lng: 80.34553 },
-        zoom: 18,
-      });
-
-      markers.forEach((m) => {
-        new maps.Marker({
-          position: m.coords,
-          map: mapInstance.current,
-          icon: m.IconImage,
-          title: m.title,
-        });
-      });
-
-      addClickListener();
+  // 1. Handle Click to add Markers
+  const MapClickHandler = () => {
+    useMapEvents({
+      click(e) {
+        setCheckPoints((prev) => [...prev, [e.latlng.lat, e.latlng.lng]]);
+      },
     });
-  }, []);
-
-  const addClickListener = () => {
-    // const placeStartMarker = (coords: any) => {
-    //   if (startMarkerRef.current) startMarkerRef.current.setMap(null);
-
-    //   startMarkerRef.current = new mapsApi.current.Marker({
-    //     position: coords,
-    //     map: mapInstance.current!,
-    //     icon: "https://maps.google.com/mapfiles/ms/icons/green-dot.png",
-    //     title: "Start Point",
-    //   });
-    // };
-
-    // const placeEndMarker = (coords: any) => {
-    //   if (endMarkerRef.current) endMarkerRef.current.setMap(null);
-
-    //   endMarkerRef.current = new mapsApi.current.Marker({
-    //     position: coords,
-    //     map: mapInstance.current!,
-    //     icon: "https://maps.google.com/mapfiles/ms/icons/red-dot.png",
-    //     title: "End Point",
-    //   });
-    // };
-
-    mapInstance.current.addListener("click", (event: any) => {
-      const pos = {
-        lat: event.latLng.lat(),
-        lng: event.latLng.lng(),
-      };
-
-      setCheckPoints((prev: any) => {
-        const newPoints = [...prev, pos];
-
-        // Add marker for each click
-        const marker = new mapsApi.current.Marker({
-          position: pos,
-          map: mapInstance.current,
-          label: `${newPoints.length}`,
-        });
-
-        marker.addListener("click", () => {
-          removePoint(marker, pos);
-        });
-
-        markersRef.current.push(marker);
-
-        return newPoints;
-      });
-    });
+    return null;
   };
 
-  const removePoint = (marker: any, point: any) => {
-    // Remove marker from map
-    marker.setMap(null);
-
-    // Remove marker from markersRef
-    markersRef.current = markersRef.current.filter((m) => m !== marker);
-
-    // Remove point from checkPoints
-    setCheckPoints((prev: any) =>
-      prev.filter((p: any) => p.lat !== point.lat || p.lng !== point.lng)
-    );
-
-    // Redraw route after removal
-    if (checkPoints.length > 1) {
-      handleCalculate(true); // recalc without alert
-    } else if (routePolylineRef.current) {
-      routePolylineRef.current.setMap(null);
-    }
-  };
-
-  const handleCalculate = async (silent = false) => {
-    if (checkPoints.length < 2) {
-      alert("Please select at least 2 points!");
-      return;
-    }
+  // 2. Logic to calculate Route and Midpoints
+  const handleCalculate = async () => {
+    if (checkPoints.length < 2) return alert("Add at least 2 points");
 
     const apiKey = "11e685bcf1e448a8ab56b428e61dfad4";
-
-    const waypointsString = checkPoints
-      .map((p: any) => `${p.lat},${p.lng}`)
-      .join("|");
-
-    const url = `https://api.geoapify.com/v1/routing?waypoints=${waypointsString}&mode=drive&apiKey=${apiKey}`;
-
-    // const url = `https://api.geoapify.com/v1/routing?waypoints=${start.lat},${start.lng}|${end.lat},${end.lng}&mode=drive&apiKey=${apiKey}`;
+    const waypoints = checkPoints.map(p => `${p[0]},${p[1]}`).join('|');
+    const url = `https://api.geoapify.com/v1/routing?waypoints=${waypoints}&mode=drive&apiKey=${apiKey}`;
 
     try {
       const response = await fetch(url);
       const data = await response.json();
-      console.log(data);
+      
+      // Extract coordinates for the road path
+      const coords = data.features[0].geometry.coordinates[0].map(
+        (c: any) => [c[1], c[0]] as [number, number]
+      );
+      setRoutePath(coords);
 
-      const legs = data.features[0].properties.legs;
-
-      let totalDistance = 0;
-      let totalTime = 0;
-
-      legs.forEach((l: any) => {
-        totalDistance += l.distance;
-        totalTime += l.time;
-      });
-
-      alert(`Distance: ${totalDistance} m\nDuration: ${totalTime} seconds`);
-
-      // if (!silent)
-      //   alert(
-      //     `Distance: ${totalDistance} m\nDuration: ${totalTime.toFixed(
-      //       2
-      //     )} seconds`
-      //   );
-
-      drawRoute(data);
-    } catch (error: any) {
-      alert("Failed to Calculate");
-      console.log(error);
-    }
-  };
-
-  const drawRoute = (data: any) => {
-    const coordsArray = data?.features?.[0]?.geometry?.coordinates;
-
-    if (!data.features || !data.features[0]?.geometry?.coordinates) {
-      alert("No route found");
-      return;
-    }
-
-    if (routePolylineRef.current) {
-      routePolylineRef.current.setMap(null);
-    }
-
-    // let coordsArray = data.features[0].geometry.coordinates;
-
-    let path: { lat: number; lng: number }[] = [];
-
-    // coordsArray.forEach((segment: any) => {
-    //   segment.forEach((c: any) => {
-    //     path.push({
-    //       lat: Number(c[1]),
-    //       lng: Number(c[0]),
-    //     });
-    //   });
-    // });
-
-    if (coordsArray && coordsArray.length > 0) {
-      coordsArray.forEach((segment: any) => {
-        if (segment.length === 0) return;
-        segment.forEach((c: any) => {
-          path.push({ lat: Number(c[1]), lng: Number(c[0]) });
+      // 3. Calculate Midpoints using Turf.js
+      const newMidpoints = [];
+      for (let i = 0; i < checkPoints.length - 1; i++) {
+        const p1 = turf.point([checkPoints[i][1], checkPoints[i][0]]);
+        const p2 = turf.point([checkPoints[i+1][1], checkPoints[i+1][0]]);
+        const mid = turf.midpoint(p1, p2);
+        newMidpoints.push({
+          coords: [mid.geometry.coordinates[1], mid.geometry.coordinates[0]],
+          label: `Mid ${i+1}-${i+2}`
         });
-      });
-      // } else if (checkPoints.length > 1) {
-      //   checkPoints.map((p: any) => {
-      //     path.push({ lat: p.lat, lng: p.lng });
-      //   });
-    }
-    if (path.length === 0 && checkPoints.length > 1) {
-      checkPoints.forEach((p: any) => {
-        path.push({ lat: p.lat, lng: p.lng });
-      });
-    }
-
-    if (path.length === 0) {
-      alert("No valid route coordinates");
-      return;
-    }
-
-    console.log("Path", path);
-    // Draw Polyline
-    routePolylineRef.current = new mapsApi.current.Polyline({
-      path,
-      map: mapInstance.current,
-      strokeColor: "#007bff",
-      strokeWeight: 6,
-    });
-
-    // Fit view to route
-    const bounds = new mapsApi.current.LatLngBounds();
-    path.forEach((p: any) => bounds.extend(p));
-    mapInstance.current.fitBounds(bounds);
-  };
-
-  const highlightMidpoint = (leg: any) => {
-    const steps = leg.steps;
-    let total = 0;
-    const half = leg.distance.value / 2;
-
-    for (let step of steps) {
-      total += step.distance.value;
-
-      if (total >= half) {
-        const pos = step.end_location;
-
-        new mapsApi.current.Marker({
-          position: pos,
-          map: mapInstance.current,
-          label: "M",
-        });
-
-        break;
       }
+      setMidpoints(newMidpoints);
+
+    } catch (error) {
+      console.error("Routing error:", error);
     }
   };
-  //
 
-  console.log(checkPoints);
-
-  const reset = () => {
-    setCheckPoints([]);
-
-    markersRef.current.forEach((m) => m.setMap(null));
-    markersRef.current = [];
-
-    if (routePolylineRef.current) {
-      routePolylineRef.current.setMap(null);
+  // 4. Haversine Distance Table Logic
+  const distances = useMemo(() => {
+    const result = [];
+    for (let i = 0; i < checkPoints.length - 1; i++) {
+      const from = turf.point([checkPoints[i][1], checkPoints[i][0]]);
+      const to = turf.point([checkPoints[i+1][1], checkPoints[i+1][0]]);
+      const dist = turf.distance(from, to, { units: 'kilometers' });
+      result.push({ from: i + 1, to: i + 2, dist: dist.toFixed(3) });
     }
-  };
+    return result;
+  }, [checkPoints]);
 
   return (
-    <>
-      <div ref={mapRef} style={{ width: "80%", height: "80vh" }} />
+    <div style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
+      <MapContainer 
+        center={[27.696, 85.336]} 
+        zoom={15} 
+        style={{ height: "70vh", width: "90%", borderRadius: "10px", marginTop: "20px" }}
+      >
+        <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
+        <MapClickHandler />
 
-      <div className="" style={{ gap: "10px" }}>
-        <button
-          onClick={() => handleCalculate()}
-          style={{ padding: "10px", margin: "5px" }}
-        >
-          Calculate
-        </button>
+        {/* User Markers */}
+        {checkPoints.map((position, idx) => (
+          <Marker key={idx} position={position}>
+            <Popup>Point {idx + 1}</Popup>
+          </Marker>
+        ))}
 
-        <button onClick={reset} style={{ padding: "10px", margin: "5px" }}>
-          Reset
-        </button>
+        {/* Road Route Polyline */}
+        {routePath.length > 0 && <Polyline positions={routePath} color="blue" weight={5} />}
+
+        {/* Midpoint Markers (Custom Color) */}
+        {midpoints.map((m, idx) => (
+          <Marker 
+            key={`mid-${idx}`} 
+            position={m.coords} 
+            icon={L.divIcon({ className: 'midpoint-label', html: `<div style="background: red; color: white; padding: 2px 5px; border-radius: 5px;">${m.label}</div>` })}
+          />
+        ))}
+      </MapContainer>
+
+      <div style={{ margin: "20px" }}>
+        <button onClick={handleCalculate} style={{ padding: "10px 20px", marginRight: "10px" }}>Calculate Route & Midpoints</button>
+        <button onClick={() => {setCheckPoints([]); setRoutePath([]); setMidpoints([])}}>Reset</button>
       </div>
-    </>
+
+      {/* Distance Table */}
+      <table border={1} style={{ width: "80%", textAlign: "center", borderCollapse: "collapse" }}>
+        <thead>
+          <tr style={{ background: "#eee" }}>
+            <th>From</th><th>To</th><th>Straight Distance (Turf.js)</th>
+          </tr>
+        </thead>
+        <tbody>
+          {distances.map((d, i) => (
+            <tr key={i}>
+              <td>Point {d.from}</td><td>Point {d.to}</td><td>{d.dist} km</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   );
 }
 
