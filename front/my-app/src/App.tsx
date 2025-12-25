@@ -7,7 +7,7 @@ import "leaflet/dist/leaflet.css";
 /** * CONFIGURATION
  * Threshold in meters: if marker is farther than this from the road, it's "off-road"
  */
-const OFF_ROAD_THRESHOLD_METERS = 50;
+const OFF_ROAD_THRESHOLD_METERS =20;
 
 /**
  * UI HELPERS
@@ -87,6 +87,7 @@ export default function App() {
     try {
       const response = await fetch(url);
       const data = await response.json();
+      console.log("Routing data:", data);
       if (data.features && data.features.length > 0) {
         // Flatten geometry coordinates to [lat, lng]
         const allCoords = data.features[0].geometry.coordinates.flatMap((segment: any[]) => 
@@ -101,35 +102,216 @@ export default function App() {
 
   // 4. Detailed Data Memo (Off-road status, connections, distances)
   const analysis = useMemo(() => {
-    const pointsData = checkPoints.map((point) => {
+    // First pass: determine which checkpoints are on-road vs off-road
+    const pointsData = checkPoints.map((point, idx) => {
       const { distance, nearestPoint } = getNearestPointOnRoute(point, routePath);
       const isOffRoad = routePath.length > 0 && distance > OFF_ROAD_THRESHOLD_METERS;
-      return { point, distance, nearestPoint, isOffRoad };
+      return {
+        point,
+        distance,
+        nearestPoint,
+        isOffRoad,
+        index: idx,
+        connectedToIndex: -1, // Index of point this offroad point connects to
+        connectionDistance: 0, // Distance to connected point
+        isProcessed: !isOffRoad // On-road points are already "processed"
+      };
     });
 
-    let totalOffRoadMeters = 0;
-    pointsData.forEach(p => {
-      if (p.isOffRoad) totalOffRoadMeters += p.distance;
+    // Second pass: for off-road points, find nearest checkpoint (on-road or already processed off-road)
+    // Process in order so earlier off-road points can serve as connection points for later ones
+    const processedIndices: number[] = [];
+    
+    // First, add all on-road points to processed list
+    pointsData.forEach((data, idx) => {
+      if (!data.isOffRoad) {
+        processedIndices.push(idx);
+      }
     });
 
-    let straightPathKm = 0;
-    const segments = [];
-    for (let i = 0; i < checkPoints.length - 1; i++) {
-      const d = turf.distance(
-        turf.point([checkPoints[i][1], checkPoints[i][0]]),
-        turf.point([checkPoints[i+1][1], checkPoints[i+1][0]]),
-        { units: 'kilometers' }
-      );
-      straightPathKm += d;
-      segments.push({ from: i + 1, to: i + 2, d: d.toFixed(3) });
+    // Now process off-road points in order
+    pointsData.forEach((data, idx) => {
+      if (data.isOffRoad) {
+        let minDistance = Infinity;
+        let nearestIdx = -1;
+
+        // Find nearest among all processed checkpoints (on-road + already processed off-road)
+        processedIndices.forEach((processedIdx) => {
+          const processedData = pointsData[processedIdx];
+          const dist = turf.distance(
+            turf.point([data.point[1], data.point[0]]),
+            turf.point([processedData.point[1], processedData.point[0]]),
+            { units: 'meters' }
+          );
+          if (dist < minDistance) {
+            minDistance = dist;
+            nearestIdx = processedIdx;
+          }
+        });
+
+        data.connectedToIndex = nearestIdx;
+        data.connectionDistance = minDistance;
+        data.isProcessed = true;
+        
+        // Add this off-road point to processed list so next off-road points can connect to it
+        processedIndices.push(idx);
+      }
+    });
+
+    // Calculate segments and distances
+    const segments: Array<{
+      from: number,
+      to: number,
+      d: string,
+      type: string
+    }> = [];
+    const polylineSegments: Array<{
+      positions: [number, number][],
+      color: string,
+      isOffRoad: boolean,
+      dashArray?: string,
+      fromIdx: number,
+      toIdx: number,
+      distance: number
+    }> = [];
+
+    let totalOnRoadKm = 0;
+    let totalOffRoadKm = 0;
+
+    // Track which connections we've already drawn to avoid duplicates
+    const drawnConnections = new Set<string>();
+
+    // First, draw on-road segments between consecutive on-road points
+    const onRoadPoints = pointsData.filter(d => !d.isOffRoad);
+    for (let i = 0; i < onRoadPoints.length - 1; i++) {
+      const currentData = onRoadPoints[i];
+      const nextData = onRoadPoints[i + 1];
+      
+      const currentRoutePoint = currentData.nearestPoint;
+      const nextRoutePoint = nextData.nearestPoint;
+
+      if (currentRoutePoint && nextRoutePoint) {
+        // Find closest route indices for both points
+        let currentRouteIdx = -1;
+        let nextRouteIdx = -1;
+        let minDistCurrent = Infinity;
+        let minDistNext = Infinity;
+
+        routePath.forEach((p, pIdx) => {
+          const distToCurrent = turf.distance(
+            turf.point([p[1], p[0]]),
+            turf.point([currentRoutePoint[1], currentRoutePoint[0]]),
+            { units: 'meters' }
+          );
+          const distToNext = turf.distance(
+            turf.point([p[1], p[0]]),
+            turf.point([nextRoutePoint[1], nextRoutePoint[0]]),
+            { units: 'meters' }
+          );
+
+          if (distToCurrent < minDistCurrent) {
+            minDistCurrent = distToCurrent;
+            currentRouteIdx = pIdx;
+          }
+          if (distToNext < minDistNext) {
+            minDistNext = distToNext;
+            nextRouteIdx = pIdx;
+          }
+        });
+
+        let routeSegment: [number, number][] = [];
+        if (currentRouteIdx !== -1 && nextRouteIdx !== -1) {
+          const startIdx = Math.min(currentRouteIdx, nextRouteIdx);
+          const endIdx = Math.max(currentRouteIdx, nextRouteIdx);
+          routeSegment = routePath.slice(startIdx, endIdx + 1);
+        } else {
+          routeSegment = [currentData.point, nextData.point];
+        }
+
+        // Calculate distance along route
+        let segmentDistance = 0;
+        for (let j = 0; j < routeSegment.length - 1; j++) {
+          segmentDistance += turf.distance(
+            turf.point([routeSegment[j][1], routeSegment[j][0]]),
+            turf.point([routeSegment[j + 1][1], routeSegment[j + 1][0]]),
+            { units: 'kilometers' }
+          );
+        }
+
+        const connectionKey = `${currentData.index}-${nextData.index}`;
+        if (!drawnConnections.has(connectionKey)) {
+          drawnConnections.add(connectionKey);
+
+          polylineSegments.push({
+            positions: routeSegment,
+            color: "#22c55e",
+            isOffRoad: false,
+            fromIdx: currentData.index,
+            toIdx: nextData.index,
+            distance: segmentDistance
+          });
+
+          segments.push({
+            from: currentData.index + 1,
+            to: nextData.index + 1,
+            d: segmentDistance.toFixed(3),
+            type: "On-road"
+          });
+
+          totalOnRoadKm += segmentDistance;
+        }
+      }
     }
 
-    return { pointsData, segments, straightPathKm, totalOffRoadKm: totalOffRoadMeters / 1000 };
+    // Now draw off-road connections
+    pointsData.forEach((data) => {
+      if (data.isOffRoad && data.connectedToIndex !== -1) {
+        const connectedData = pointsData[data.connectedToIndex];
+        const distanceKm = data.connectionDistance / 1000;
+
+        const connectionKey = `offroad-${data.index}-${data.connectedToIndex}`;
+        if (!drawnConnections.has(connectionKey)) {
+          drawnConnections.add(connectionKey);
+
+          polylineSegments.push({
+            positions: [data.point, connectedData.point],
+            color: "#ef4444",
+            isOffRoad: true,
+            dashArray: "5, 10",
+            fromIdx: data.index,
+            toIdx: data.connectedToIndex,
+            distance: distanceKm
+          });
+
+          const connectedType = connectedData.isOffRoad ? "Off-road" : "On-road";
+          segments.push({
+            from: data.index + 1,
+            to: data.connectedToIndex + 1,
+            d: distanceKm.toFixed(3),
+            type: `Off-road → ${connectedType} point`
+          });
+
+          totalOffRoadKm += distanceKm;
+        }
+      }
+    });
+
+    // Sort segments by 'from' point for better display
+    segments.sort((a, b) => a.from - b.from);
+
+    return {
+      pointsData,
+      segments,
+      polylineSegments,
+      totalOnRoadKm,
+      totalOffRoadKm,
+      totalDistanceKm: totalOnRoadKm + totalOffRoadKm
+    };
   }, [checkPoints, routePath]);
 
   return (
     <div style={{ padding: "20px", fontFamily: "Arial, sans-serif", display: "flex", flexDirection: "column", alignItems: "center" }}>
-      <h2>Smart Route Planner</h2>
+      
       <p style={{ color: "#666" }}>Click to add. <b>Double-click marker to remove.</b></p>
       
       <MapContainer 
@@ -151,27 +333,34 @@ export default function App() {
             <Popup>
               <b>Point {idx + 1}</b><br/>
               {routePath.length > 0 ? (
-                data.isOffRoad ? `⚠️ Off-road: ${data.distance.toFixed(1)}m` : `✅ On-road`
+                data.isOffRoad ? (
+                  <>
+                    ⚠️ Off-road: {data.distance.toFixed(1)}m from route<br/>
+                    {data.connectedToIndex !== -1 && (
+                      <>
+                        Connected to Point {data.connectedToIndex + 1}
+                        {analysis.pointsData[data.connectedToIndex].isOffRoad ? ' (Off-road)' : ' (On-road)'}<br/>
+                        Distance: {data.connectionDistance.toFixed(1)}m
+                      </>
+                    )}
+                  </>
+                ) : `✅ On-road`
               ) : "Calculate to check road status"}
             </Popup>
           </Marker>
         ))}
 
-        {/* Connectors: Off-road point to nearest road point */}
-        {analysis.pointsData.map((data, idx) => (
-          data.isOffRoad && data.nearestPoint && (
-            <Polyline 
-              key={`conn-${idx}`} 
-              positions={[data.point, data.nearestPoint]} 
-              color="#ef4444" 
-              dashArray="5, 10" 
-              weight={2} 
-            />
-          )
+        {/* Route Segments: On-road and Off-road connections */}
+        {analysis.polylineSegments.map((segment, idx) => (
+          <Polyline
+            key={`segment-${idx}`}
+            positions={segment.positions}
+            color={segment.color}
+            dashArray={segment.dashArray}
+            weight={segment.isOffRoad ? 3 : 5}
+            opacity={0.8}
+          />
         ))}
-
-        {/* Main Road Route */}
-        {routePath.length > 0 && <Polyline positions={routePath} color="#2563eb" weight={5} opacity={0.8} />}
       </MapContainer>
 
       <div style={{ margin: "20px 0" }}>
@@ -191,15 +380,30 @@ export default function App() {
             </thead>
             <tbody>
               {analysis.segments.map((s, i) => (
-                <tr key={i} style={{ borderBottom: "1px solid #eee" }}>
-                  <td style={tdStyle}>Segment {s.from} → {s.to} (Straight Line)</td>
+                <tr
+                  key={i}
+                  style={{
+                    borderBottom: "1px solid #eee",
+                    background: s.type === "Off-road" ? "#fef2f2" : "#f0fdf4"
+                  }}
+                >
+                  <td style={tdStyle}>
+                    Point {s.from} → {s.to} ({s.type})
+                  </td>
                   <td style={tdStyle}>{s.d} km</td>
                 </tr>
               ))}
-              
+
+              {analysis.totalOnRoadKm > 0 && (
+                <tr style={{ color: "#22c55e", background: "#f0fdf4", fontWeight: "bold" }}>
+                  <td style={tdStyle}>Total On-Road Distance</td>
+                  <td style={tdStyle}>{analysis.totalOnRoadKm.toFixed(3)} km</td>
+                </tr>
+              )}
+
               {analysis.totalOffRoadKm > 0 && (
-                <tr style={{ color: "#ef4444", background: "#fef2f2" }}>
-                  <td style={tdStyle}><b>Total Off-Road Access Distance</b></td>
+                <tr style={{ color: "#ef4444", background: "#fef2f2", fontWeight: "bold" }}>
+                  <td style={tdStyle}>Total Off-Road Distance</td>
                   <td style={tdStyle}>{analysis.totalOffRoadKm.toFixed(3)} km</td>
                 </tr>
               )}
@@ -207,7 +411,7 @@ export default function App() {
               <tr style={{ background: "#e2e8f0", fontWeight: "bold" }}>
                 <td style={tdStyle}>Total Calculated Distance</td>
                 <td style={tdStyle}>
-                  {(analysis.straightPathKm + analysis.totalOffRoadKm).toFixed(3)} km
+                  {analysis.totalDistanceKm.toFixed(3)} km
                 </td>
               </tr>
             </tbody>
