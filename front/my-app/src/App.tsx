@@ -528,10 +528,8 @@ function App() {
     // Only use label if it exists and is not empty - labels are route-specific
     const label = routeData.label && routeData.label.trim() !== "" ? routeData.label : "";
 
-    // Restore checkpoints with connector lines BEFORE drawing the route
-    if (routeData.checkpoints && routeData.checkpoints.length > 0) {
-      restoreCheckpoints(routeData.checkpoints);
-    }
+    // DO NOT restore checkpoints - only restore the route polyline and labels
+    // This ensures new markers start from point 1 after refresh
 
     // Draw the route with its specific label (or no label if none was provided)
     // Labels only appear on the route path where they were originally provided
@@ -561,72 +559,12 @@ function App() {
       const routes = loadSavedRoutes();
       if (routes.length > 0) {
         console.log("Loading saved routes:", routes.length);
-        // Restore all saved routes
+        // Restore all saved routes (only polylines and labels, not markers)
         routes.forEach((route: any, routeIndex: number) => {
           console.log(`Restoring route ${routeIndex + 1}: ${route.label}`);
           restoreRoute(route);
         });
-        
-        // Final pass: Ensure all connector lines are drawn after all routes are restored
-        // This handles cases where connector lines couldn't be drawn during restoration
-        setTimeout(() => {
-          console.log("Final pass: Ensuring all connector lines are drawn");
-          routes.forEach((route: any) => {
-            if (route.checkpoints && route.checkpoints.length > 0) {
-              route.checkpoints.forEach((checkpointInfo: any) => {
-                if (!checkpointInfo.position) return;
-                
-                // Find the marker for this checkpoint
-                const marker = markersRef.current.find((m: any) => {
-                  const pos = m.getPosition();
-                  if (!pos) return false;
-                  return Math.abs(pos.lat() - checkpointInfo.position.lat) < 0.000001 &&
-                         Math.abs(pos.lng() - checkpointInfo.position.lng) < 0.000001;
-                });
-                
-                if (!marker || marker.connectorPolyline) return; // Skip if no marker or already has connector
-                
-                // Only ensure off-road checkpoints have connector lines
-                // On-road checkpoints connect via the route path
-                const isOffRoad = checkpointInfo.isOffRoad || !!checkpointInfo.snappedPoint;
-                if (isOffRoad) {
-                  // Find nearest checkpoint
-                  let nearestCheckpoint: any = null;
-                  let minDist = Infinity;
-                  
-                  markersRef.current.forEach((otherMarker: any) => {
-                    if (otherMarker === marker) return;
-                    const otherPos = otherMarker.getPosition();
-                    if (otherPos) {
-                      const dist = calculateDistance(
-                        checkpointInfo.position,
-                        { lat: otherPos.lat(), lng: otherPos.lng() }
-                      );
-                      if (dist < minDist && dist > 0) {
-                        minDist = dist;
-                        nearestCheckpoint = { lat: otherPos.lat(), lng: otherPos.lng() };
-                      }
-                    }
-                  });
-                  
-                  if (nearestCheckpoint) {
-                    console.log(`Final pass: Connecting off-road checkpoint to nearest checkpoint`);
-                    const connectorPolyline = new mapsApi.current.Polyline({
-                      path: [checkpointInfo.position, nearestCheckpoint],
-                      map: mapInstance.current,
-                      strokeColor: "#FF0000",
-                      strokeWeight: 3,
-                      strokeOpacity: 0.8,
-                    });
-
-                    marker.connectorPolyline = connectorPolyline;
-                    connectorPolylinesRef.current.push(connectorPolyline);
-                  }
-                }
-              });
-            }
-          });
-        }, 500); // Small delay to ensure all routes are fully restored
+        // New markers will start from point 1
       }
     });
   }, []);
@@ -664,7 +602,7 @@ console.log("Checkpoint Info:",event)
   };
 
   // --- MODIFICATION START ---
-  // This function checks if a click is off-road and draws a straight line to the closest checkpoint (on-road or off-road)
+  // Snap clicks to the nearest road and, when off-road, draw a connector to the snapped (on-road) point
   const snapToRoadAndDrawConnector = async (originalPos: any, marker: any, existingCheckpoints: any[]) => {
     const apiKey = "11e685bcf1e448a8ab56b428e61dfad4";
     const url = `https://api.geoapify.com/v1/routing?waypoints=${originalPos.lat},${originalPos.lng}|${originalPos.lat},${originalPos.lng}&mode=drive&apiKey=${apiKey}`;
@@ -688,42 +626,20 @@ console.log("Checkpoint Info:",event)
   
           // IMPORTANT: Only off-road checkpoints should have connector lines
           // On-road checkpoints connect via the route path, not via connector lines
-          // If the click is off-road, find the closest checkpoint and draw a connector line
-          if (isOffRoad && existingCheckpoints.length > 0) {
-            // Find the closest checkpoint from existing checkpoints array (both on-road and off-road)
-            let nearestCheckpoint: any = null;
-            let nearestCheckpointIndex: number = -1;
-            let minDist = Infinity;
-  
-            // Iterate through ALL existing checkpoints (both on-road and off-road)
-            existingCheckpoints.forEach((checkpoint, index) => {
-              // Calculate distance to this checkpoint (regardless of whether it's on-road or off-road)
-              const dist = calculateDistance(originalPos, checkpoint);
-              
-              // Update if this is the closest checkpoint so far
-              if (dist < minDist) {
-                minDist = dist;
-                nearestCheckpoint = checkpoint;
-                nearestCheckpointIndex = index;
-              }
+          // If the click is off-road, draw a connector to the snapped on-road point
+          if (isOffRoad) {
+            const connectorPolyline = new mapsApi.current.Polyline({
+              path: [originalPos, snappedPoint],
+              map: mapInstance.current,
+              strokeColor: "#FF0000",
+              strokeWeight: 3,
+              strokeOpacity: 0.8,
             });
-  
-            // If we found a checkpoint, draw a straight line to it
-            if (nearestCheckpoint) {
-              const connectorPolyline = new mapsApi.current.Polyline({
-                path: [originalPos, nearestCheckpoint],
-                map: mapInstance.current,
-                strokeColor: "#FF0000",
-                strokeWeight: 3,
-                strokeOpacity: 0.8,
-              });
-  
-              marker.connectorPolyline = connectorPolyline;
-              marker.connectorToIndex = nearestCheckpointIndex; // Store the target checkpoint index
-              connectorPolylinesRef.current.push(connectorPolyline);
-            }
-  
-            // Also create a road marker at the snapped point for off-road checkpoints
+
+            marker.connectorPolyline = connectorPolyline;
+            connectorPolylinesRef.current.push(connectorPolyline);
+
+            // Create a road marker at the snapped point for off-road checkpoints
             const roadMarker = new mapsApi.current.Marker({
               position: snappedPoint,
               map: mapInstance.current,
@@ -737,7 +653,7 @@ console.log("Checkpoint Info:",event)
               },
               title: "Road connection point",
             });
-  
+
             marker.roadMarker = roadMarker;
           }
         }
@@ -835,6 +751,38 @@ console.log("Checkpoint Info:",event)
     }
   };
 
+  // Clear working markers after a route is saved, so new markers start from 1
+  // This keeps the route polyline and labels visible but removes the checkpoint markers
+  const clearWorkingMarkers = () => {
+    // Remove all checkpoint markers from the map
+    markersRef.current.forEach((m) => {
+      m.setMap(null);
+      if (m.connectorPolyline) {
+        m.connectorPolyline.setMap(null);
+      }
+      if (m.roadMarker) {
+        m.roadMarker.setMap(null);
+      }
+    });
+    markersRef.current = [];
+
+    // Clear connector polylines
+    connectorPolylinesRef.current.forEach((p) => p.setMap(null));
+    connectorPolylinesRef.current = [];
+
+    // Clear checkpoints and distances state - new markers will start from 1
+    setCheckPoints([]);
+    setDistances([]);
+
+    // Clear the current route polyline reference (but saved routes remain visible)
+    if (routePolylineRef.current) {
+      routePolylineRef.current = null;
+    }
+
+    // Clear route label markers for the current route (saved route labels are in allRoutesRef)
+    routeLabelMarkersRef.current = [];
+  };
+
   const handleCalculate = async (silent = false) => {
     if (checkPoints.length < 2) {
       if (!silent) alert("Please select at least 2 points!");
@@ -854,7 +802,26 @@ console.log("Checkpoint Info:",event)
 
     const apiKey = "11e685bcf1e448a8ab56b428e61dfad4";
 
-    const waypointsString = checkPoints
+    // Prefer snapped on-road points when available so routing uses drivable coordinates
+    const effectivePoints = checkPoints
+      .map((p: any, idx: number) => {
+        const marker = markersRef.current[idx];
+        const snapped = marker?.roadMarker?.getPosition?.();
+        if (snapped) {
+          return { lat: snapped.lat(), lng: snapped.lng() };
+        }
+        return p;
+      })
+      .filter((p: any) =>
+        p && typeof p.lat === "number" && typeof p.lng === "number" && isFinite(p.lat) && isFinite(p.lng)
+      );
+
+    if (effectivePoints.length < 2) {
+      if (!silent) alert("Please ensure at least two checkpoints are on or snapped to a road.");
+      return;
+    }
+
+    const waypointsString = effectivePoints
       .map((p: any) => `${p.lat},${p.lng}`)
       .join("|");
 
@@ -863,10 +830,17 @@ console.log("Checkpoint Info:",event)
     try {
       const response = await fetch(url);
       const data = await response.json();
-      console.log("REsponse:",data)
+      console.log("Response:", data);
       
       if (!data.features || data.features.length === 0) {
-        if (!silent) alert("Failed to calculate route.");
+        const allOffRoad = markersRef.current.length > 0 && markersRef.current.every((m: any) => m.roadMarker);
+        if (!silent) {
+          if (allOffRoad) {
+            alert("Unable to calculate route: all checkpoints are off-road. Please add or move a checkpoint onto a road.");
+          } else {
+            alert("Failed to calculate route. Please make sure checkpoints are on reachable roads.");
+          }
+        }
         return;
       }
 
@@ -888,9 +862,20 @@ console.log("Checkpoint Info:",event)
       // Pass only the checkpoints used for THIS route calculation
       if (routeLabel) {
         saveRouteData(routeLabel, data, distances, checkPoints);
+        
+        // Clear working markers after saving, so new markers start from 1
+        // Keep the route polyline visible but remove the checkpoint markers
+        clearWorkingMarkers();
       }
     } catch (error: any) {
-      if (!silent) alert("Failed to Calculate");
+      const allOffRoad = markersRef.current.length > 0 && markersRef.current.every((m: any) => m.roadMarker);
+      if (!silent) {
+        if (allOffRoad) {
+          alert("Unable to calculate route: all checkpoints are off-road. Please add or move a checkpoint onto a road.");
+        } else {
+          alert("Failed to calculate route. Error: " + (error?.message || "Unknown error"));
+        }
+      }
       console.log(error);
     }
   };
@@ -1038,6 +1023,11 @@ console.log("Checkpoint Info:",event)
       }
     });
     allRoutesRef.current = [];
+
+    // Clear saved routes from localStorage so they don't reload on refresh
+    localStorage.removeItem("savedRoutes");
+    setSavedRoutes([]);
+    savedRoutesRef.current = [];
   };
 
   return (
