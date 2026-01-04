@@ -76,22 +76,466 @@ const createHouseIcon = (houseNo: string, isOffRoad: boolean = false) => {
 };
 
 /**
+ * GRAPH DATA STRUCTURES
+ */
+interface GraphNode {
+  id: string;
+  position: [number, number];
+  pointIndex?: number; // Reference to original point
+  type: 'checkpoint' | 'house' | 'road-node' | 'virtual';
+}
+
+interface GraphEdge {
+  id: string;
+  from: string;
+  to: string;
+  weight: number; // distance in meters
+  positions: [number, number][]; // for rendering
+  type: 'road' | 'off-road' | 'virtual';
+}
+
+interface RouteGraph {
+  nodes: Map<string, GraphNode>;
+  edges: Map<string, GraphEdge>;
+  adjacency: Map<string, string[]>; // nodeId -> connected edgeIds
+}
+
+/**
+ * GRAPH CONSTRUCTION
+ */
+const buildRouteGraph = (
+  routePath: [number, number][],
+  savedPaths: any[],
+  allPoints: any[]
+): RouteGraph => {
+  const graph: RouteGraph = {
+    nodes: new Map(),
+    edges: new Map(),
+    adjacency: new Map()
+  };
+
+  // Step 1: Add road nodes from main route
+  if (routePath.length >= 2) {
+    routePath.forEach((pos, idx) => {
+      const nodeId = `road-${idx}`;
+      graph.nodes.set(nodeId, {
+        id: nodeId,
+        position: pos,
+        type: 'road-node'
+      });
+      
+      // Create edge to next node
+      if (idx < routePath.length - 1) {
+        const edgeId = `road-edge-${idx}`;
+        const distance = turf.distance(
+          turf.point([pos[1], pos[0]]),
+          turf.point([routePath[idx + 1][1], routePath[idx + 1][0]]),
+          { units: 'meters' }
+        );
+        
+        graph.edges.set(edgeId, {
+          id: edgeId,
+          from: nodeId,
+          to: `road-${idx + 1}`,
+          weight: distance,
+          positions: [pos, routePath[idx + 1]],
+          type: 'road'
+        });
+        
+        // Add to adjacency list (bidirectional)
+        if (!graph.adjacency.has(nodeId)) graph.adjacency.set(nodeId, []);
+        if (!graph.adjacency.has(`road-${idx + 1}`)) graph.adjacency.set(`road-${idx + 1}`, []);
+        graph.adjacency.get(nodeId)!.push(edgeId);
+        graph.adjacency.get(`road-${idx + 1}`)!.push(edgeId);
+      }
+    });
+  }
+
+  // Step 2: Add saved off-road paths and custom roads as edges
+  savedPaths.forEach((savedPath, pathIdx) => {
+    if (savedPath.positions && savedPath.positions.length >= 2) {
+      savedPath.positions.forEach((pos: [number, number], idx: number) => {
+        const nodeId = `saved-${pathIdx}-${idx}`;
+        graph.nodes.set(nodeId, {
+          id: nodeId,
+          position: pos,
+          type: 'road-node'
+        });
+        
+        if (idx < savedPath.positions.length - 1) {
+          const edgeId = `saved-edge-${pathIdx}-${idx}`;
+          const distance = turf.distance(
+            turf.point([pos[1], pos[0]]),
+            turf.point([savedPath.positions[idx + 1][1], savedPath.positions[idx + 1][0]]),
+            { units: 'meters' }
+          );
+          
+          graph.edges.set(edgeId, {
+            id: edgeId,
+            from: nodeId,
+            to: `saved-${pathIdx}-${idx + 1}`,
+            weight: distance,
+            positions: [pos, savedPath.positions[idx + 1]],
+            type: savedPath.isOffRoad ? 'off-road' : 'road'
+          });
+          
+          if (!graph.adjacency.has(nodeId)) graph.adjacency.set(nodeId, []);
+          if (!graph.adjacency.has(`saved-${pathIdx}-${idx + 1}`)) graph.adjacency.set(`saved-${pathIdx}-${idx + 1}`, []);
+          graph.adjacency.get(nodeId)!.push(edgeId);
+          graph.adjacency.get(`saved-${pathIdx}-${idx + 1}`)!.push(edgeId);
+        }
+      });
+    }
+  });
+
+  // Step 2.5: Connect saved path endpoints to the network
+  // Priority: Main route first, then other custom roads (so all roads connect)
+  const connectNodeToNetwork = (nodeId: string, position: [number, number], excludePrefix: string) => {
+    let nearestNodes: { id: string; distance: number; priority: number }[] = [];
+    
+    // Check all road nodes - main route gets priority 1, custom roads get priority 2
+    graph.nodes.forEach((node, nId) => {
+      // Skip nodes from the same path (to avoid self-connection)
+      if (nId.startsWith(excludePrefix)) return;
+      if (node.type !== 'road-node') return;
+      
+      const dist = turf.distance(
+        turf.point([position[1], position[0]]),
+        turf.point([node.position[1], node.position[0]]),
+        { units: 'meters' }
+      );
+      
+      // Determine priority: main route nodes get priority 1, saved paths get priority 2
+      const isMainRouteNode = nId.startsWith('road-');
+      const priority = isMainRouteNode ? 1 : 2;
+      
+      // Use same threshold for all - 1000m to ensure connectivity
+      if (dist < 1000) {
+        nearestNodes.push({ id: nId, distance: dist, priority });
+      }
+    });
+    
+    // Sort by priority first, then by distance
+    nearestNodes.sort((a, b) => {
+      if (a.priority !== b.priority) return a.priority - b.priority;
+      return a.distance - b.distance;
+    });
+    
+    // Take closest connections, preferring main route but falling back to custom roads
+    nearestNodes = nearestNodes.slice(0, 3);
+    
+    // Create connection edges
+    nearestNodes.forEach((nearest, idx) => {
+      const edgeId = `network-connect-${nodeId}-${nearest.id}-${idx}`;
+      
+      // Check if edge already exists
+      if (graph.edges.has(edgeId)) return;
+      
+      graph.edges.set(edgeId, {
+        id: edgeId,
+        from: nodeId,
+        to: nearest.id,
+        weight: nearest.distance,
+        positions: [position, graph.nodes.get(nearest.id)!.position],
+        type: 'virtual'
+      });
+      
+      if (!graph.adjacency.has(nodeId)) graph.adjacency.set(nodeId, []);
+      if (!graph.adjacency.has(nearest.id)) graph.adjacency.set(nearest.id, []);
+      graph.adjacency.get(nodeId)!.push(edgeId);
+      graph.adjacency.get(nearest.id)!.push(edgeId);
+    });
+  };
+
+  // Connect each saved path's start and end points to the network
+  savedPaths.forEach((savedPath, pathIdx) => {
+    if (savedPath.positions && savedPath.positions.length >= 2) {
+      const startNodeId = `saved-${pathIdx}-0`;
+      const endNodeId = `saved-${pathIdx}-${savedPath.positions.length - 1}`;
+      const startPos = savedPath.positions[0];
+      const endPos = savedPath.positions[savedPath.positions.length - 1];
+      
+      // Connect start point
+      connectNodeToNetwork(startNodeId, startPos, `saved-${pathIdx}-`);
+      // Connect end point
+      connectNodeToNetwork(endNodeId, endPos, `saved-${pathIdx}-`);
+    }
+  });
+
+  // Step 3: Add point nodes and virtual connections
+  allPoints.forEach((pointData: any) => {
+    const nodeId = `point-${pointData.index}`;
+    graph.nodes.set(nodeId, {
+      id: nodeId,
+      position: pointData.point,
+      pointIndex: pointData.index,
+      type: pointData.isHouse ? 'house' : 'checkpoint'
+    });
+    
+    // Connect to nearest point on network
+    if (pointData.nearestPoint) {
+      // Find or create a node at the nearest point on the network
+      const nearestNodeId = `virtual-${pointData.index}`;
+      graph.nodes.set(nearestNodeId, {
+        id: nearestNodeId,
+        position: pointData.nearestPoint,
+        type: 'virtual'
+      });
+      
+      // Create virtual edge
+      const edgeId = `virtual-${pointData.index}`;
+      const distance = turf.distance(
+        turf.point([pointData.point[1], pointData.point[0]]),
+        turf.point([pointData.nearestPoint[1], pointData.nearestPoint[0]]),
+        { units: 'meters' }
+      );
+      
+      graph.edges.set(edgeId, {
+        id: edgeId,
+        from: nodeId,
+        to: nearestNodeId,
+        weight: distance,
+        positions: [pointData.point, pointData.nearestPoint],
+        type: 'virtual'
+      });
+      
+      if (!graph.adjacency.has(nodeId)) graph.adjacency.set(nodeId, []);
+      if (!graph.adjacency.has(nearestNodeId)) graph.adjacency.set(nearestNodeId, []);
+      graph.adjacency.get(nodeId)!.push(edgeId);
+      graph.adjacency.get(nearestNodeId)!.push(edgeId);
+      
+      // Connect virtual node to nearest actual road nodes
+      connectVirtualNodeToNetwork(graph, nearestNodeId, pointData.nearestPoint);
+    }
+  });
+
+  return graph;
+};
+
+// Helper to connect a virtual node to the nearest road network nodes
+const connectVirtualNodeToNetwork = (
+  graph: RouteGraph,
+  virtualNodeId: string,
+  position: [number, number]
+) => {
+  // Find nearest road/saved path nodes - PRIORITIZE MAIN ROUTE but allow custom roads
+  let nearestNodes: { id: string; distance: number; priority: number }[] = [];
+  
+  graph.nodes.forEach((node, nodeId) => {
+    if (node.type === 'road-node' && nodeId !== virtualNodeId) {
+      const dist = turf.distance(
+        turf.point([position[1], position[0]]),
+        turf.point([node.position[1], node.position[0]]),
+        { units: 'meters' }
+      );
+      
+      // Prioritize main route nodes (road-*) over saved path nodes (saved-*)
+      const isMainRouteNode = nodeId.startsWith('road-');
+      const priority = isMainRouteNode ? 1 : 2;
+      
+      // Use same threshold for all - 1000m to ensure connectivity
+      if (dist < 1000) {
+        nearestNodes.push({ id: nodeId, distance: dist, priority });
+      }
+    }
+  });
+  
+  // Sort by priority first, then by distance
+  nearestNodes.sort((a, b) => {
+    if (a.priority !== b.priority) return a.priority - b.priority;
+    return a.distance - b.distance;
+  });
+  nearestNodes = nearestNodes.slice(0, 3);
+  
+  // Create edges to nearest nodes
+  nearestNodes.forEach((nearest, idx) => {
+    const edgeId = `virtual-connect-${virtualNodeId}-${idx}`;
+    graph.edges.set(edgeId, {
+      id: edgeId,
+      from: virtualNodeId,
+      to: nearest.id,
+      weight: nearest.distance,
+      positions: [position, graph.nodes.get(nearest.id)!.position],
+      type: 'virtual'
+    });
+    
+    if (!graph.adjacency.has(virtualNodeId)) graph.adjacency.set(virtualNodeId, []);
+    if (!graph.adjacency.has(nearest.id)) graph.adjacency.set(nearest.id, []);
+    graph.adjacency.get(virtualNodeId)!.push(edgeId);
+    graph.adjacency.get(nearest.id)!.push(edgeId);
+  });
+};
+
+/**
+ * A* PATHFINDING ALGORITHM
+ */
+const findPathAStar = (
+  graph: RouteGraph,
+  startNodeId: string,
+  endNodeId: string
+): { path: string[]; distance: number; edges: GraphEdge[] } | null => {
+  if (!graph.nodes.has(startNodeId) || !graph.nodes.has(endNodeId)) {
+    return null;
+  }
+
+  const openSet = new Set<string>([startNodeId]);
+  const cameFrom = new Map<string, string>();
+  const gScore = new Map<string, number>();
+  const fScore = new Map<string, number>();
+  
+  gScore.set(startNodeId, 0);
+  
+  const startPos = graph.nodes.get(startNodeId)!.position;
+  const endPos = graph.nodes.get(endNodeId)!.position;
+  const heuristic = turf.distance(
+    turf.point([startPos[1], startPos[0]]),
+    turf.point([endPos[1], endPos[0]]),
+    { units: 'meters' }
+  );
+  fScore.set(startNodeId, heuristic);
+
+  while (openSet.size > 0) {
+    // Find node in openSet with lowest fScore
+    let current: string | null = null;
+    let lowestF = Infinity;
+    openSet.forEach(nodeId => {
+      const f = fScore.get(nodeId) ?? Infinity;
+      if (f < lowestF) {
+        lowestF = f;
+        current = nodeId;
+      }
+    });
+
+    if (!current || current === endNodeId) {
+      if (current === endNodeId) {
+        // Reconstruct path
+        const path: string[] = [];
+        let curr: string | undefined = endNodeId;
+        while (curr) {
+          path.unshift(curr);
+          curr = cameFrom.get(curr);
+        }
+        
+        // Get edges along path
+        const edges: GraphEdge[] = [];
+        let totalDistance = 0;
+        for (let i = 0; i < path.length - 1; i++) {
+          const fromNode = path[i];
+          const toNode = path[i + 1];
+          
+          // Find edge connecting these nodes
+          const edgeIds = graph.adjacency.get(fromNode) || [];
+          for (const edgeId of edgeIds) {
+            const edge = graph.edges.get(edgeId)!;
+            if ((edge.from === fromNode && edge.to === toNode) || 
+                (edge.from === toNode && edge.to === fromNode)) {
+              edges.push(edge);
+              totalDistance += edge.weight;
+              break;
+            }
+          }
+        }
+        
+        return { path, distance: totalDistance, edges };
+      }
+      break;
+    }
+
+    openSet.delete(current);
+    const currentGScore = gScore.get(current) ?? Infinity;
+
+    // Check all neighbors
+    const edgeIds = graph.adjacency.get(current) || [];
+    edgeIds.forEach(edgeId => {
+      const edge = graph.edges.get(edgeId)!;
+      const neighbor = edge.from === current ? edge.to : edge.from;
+      
+      const tentativeGScore = currentGScore + edge.weight;
+      const neighborGScore = gScore.get(neighbor) ?? Infinity;
+      
+      if (tentativeGScore < neighborGScore) {
+        cameFrom.set(neighbor, current!);
+        gScore.set(neighbor, tentativeGScore);
+        
+        const neighborPos = graph.nodes.get(neighbor)!.position;
+        const h = turf.distance(
+          turf.point([neighborPos[1], neighborPos[0]]),
+          turf.point([endPos[1], endPos[0]]),
+          { units: 'meters' }
+        );
+        fScore.set(neighbor, tentativeGScore + h);
+        
+        openSet.add(neighbor);
+      }
+    });
+  }
+
+  return null; // No path found
+};
+
+/**
  * CALCULATION HELPERS
  */
-const getNearestPointOnRoute = (point: [number, number], routePath: [number, number][]) => {
-  if (routePath.length < 2) return { distance: 0, nearestPoint: null };
+// Enhanced version that checks multiple paths (main route + saved off-road connections)
+const getNearestPointOnNetwork = (
+  point: [number, number], 
+  routePath: [number, number][], 
+  savedPaths: any[] = []
+) => {
+  const allPaths: [number, number][][] = [];
+  
+  // Add main route if available
+  if (routePath.length >= 2) {
+    allPaths.push(routePath);
+  }
+  
+  // Add all saved off-road paths (they become part of the network)
+  savedPaths.forEach(savedPath => {
+    if (savedPath.positions && savedPath.positions.length >= 2) {
+      allPaths.push(savedPath.positions);
+    }
+  });
+  
+  if (allPaths.length === 0) return { distance: 0, nearestPoint: null, pathType: 'none' };
+  
   const turfPoint = turf.point([point[1], point[0]]);
-  const routeCoords = routePath.map(p => [p[1], p[0]]);
-  const routeLine = turf.lineString(routeCoords);
-  const nearestPoint = turf.nearestPointOnLine(routeLine, turfPoint);
-  const distance = turf.distance(turfPoint, nearestPoint, { units: 'meters' });
-
-  const nearestCoords: [number, number] = [
-    nearestPoint.geometry.coordinates[1],
-    nearestPoint.geometry.coordinates[0]
-  ];
-  return { distance, nearestPoint: nearestCoords };
+  let minDistance = Infinity;
+  let nearestPoint: [number, number] | null = null;
+  let pathType = 'main-route';
+  
+  allPaths.forEach((path, pathIdx) => {
+    const routeCoords = path.map(p => [p[1], p[0]]);
+    const routeLine = turf.lineString(routeCoords);
+    const nearest = turf.nearestPointOnLine(routeLine, turfPoint);
+    const distance = turf.distance(turfPoint, nearest, { units: 'meters' });
+    
+    if (distance < minDistance) {
+      minDistance = distance;
+      nearestPoint = [
+        nearest.geometry.coordinates[1],
+        nearest.geometry.coordinates[0]
+      ];
+      pathType = pathIdx === 0 ? 'main-route' : 'off-road-connection';
+    }
+  });
+  
+  return { distance: minDistance, nearestPoint, pathType };
 };
+
+// Legacy function for backward compatibility (kept for reference)
+// const getNearestPointOnRoute = (point: [number, number], routePath: [number, number][]) => {
+//   if (routePath.length < 2) return { distance: 0, nearestPoint: null };
+//   const turfPoint = turf.point([point[1], point[0]]);
+//   const routeCoords = routePath.map(p => [p[1], p[0]]);
+//   const routeLine = turf.lineString(routeCoords);
+//   const nearestPoint = turf.nearestPointOnLine(routeLine, turfPoint);
+//   const distance = turf.distance(turfPoint, nearestPoint, { units: 'meters' });
+//   const nearestCoords: [number, number] = [
+//     nearestPoint.geometry.coordinates[1],
+//     nearestPoint.geometry.coordinates[0]
+//   ];
+//   return { distance, nearestPoint: nearestCoords };
+// };
 
 // Calculate bearing/direction between two points
 const getDirection = (from: [number, number], to: [number, number]): string => {
@@ -126,6 +570,9 @@ export default function App() {
   const [pathJSON, setPathJSON] = useState<any>(null);
   const [savedPaths, setSavedPaths] = useState<any[]>([]);
   const [showSavedPaths, setShowSavedPaths] = useState(true);
+  const [routeGraph, setRouteGraph] = useState<RouteGraph | null>(null);
+  const [isCreatingRoad, setIsCreatingRoad] = useState(false);
+  const [customRoadPoints, setCustomRoadPoints] = useState<[number, number][]>([]);
 
   // Load sample houses from JSON
   useEffect(() => {
@@ -159,7 +606,13 @@ export default function App() {
   const MapClickHandler = () => {
     useMapEvents({
       click(e) {
-        setCheckPoints((prev) => [...prev, [e.latlng.lat, e.latlng.lng]]);
+        if (isCreatingRoad) {
+          // Add point to custom road
+          setCustomRoadPoints((prev) => [...prev, [e.latlng.lat, e.latlng.lng]]);
+        } else {
+          // Add checkpoint as usual
+          setCheckPoints((prev) => [...prev, [e.latlng.lat, e.latlng.lng]]);
+        }
       },
     });
     return null;
@@ -226,19 +679,20 @@ export default function App() {
       })) : [])
     ];
 
-    // First pass: determine which points are on-road vs off-road
+    // First pass: determine which points are on-road vs off-road using enhanced network check
     const pointsData = allPoints.map((item) => {
-      const { distance, nearestPoint } = getNearestPointOnRoute(item.point, routePath);
-      const isOffRoad = routePath.length > 0 && distance > OFF_ROAD_THRESHOLD_METERS;
+      const { distance, nearestPoint, pathType } = getNearestPointOnNetwork(item.point, routePath, savedPaths);
+      const isOffRoad = (routePath.length > 0 || savedPaths.length > 0) && distance > OFF_ROAD_THRESHOLD_METERS;
       return {
         ...item,
         distance,
-        nearestPoint, // This is the nearest point ON THE ROUTE itself
+        nearestPoint, // This is the nearest point on ANY available path (main route or saved paths)
         isOffRoad,
         connectedToIndex: -1,
         connectionDistance: 0,
         isProcessed: !isOffRoad,
-        roadConnectionPoint: nearestPoint // Store the actual point on the road to connect to
+        roadConnectionPoint: nearestPoint, // Store the actual point on the network to connect to
+        pathType // 'main-route' or 'off-road-connection'
       };
     });
 
@@ -373,11 +827,20 @@ export default function App() {
       totalOffRoadKm,
       totalDistanceKm: totalOnRoadKm + totalOffRoadKm
     };
-  }, [checkPoints, routePath, houses, showSampleData]);
+  }, [checkPoints, routePath, houses, showSampleData, savedPaths]);
 
-  // Generate polyline segments for highlighted path including off-road connections
+  // Generate polyline segments for highlighted path using graph
   const pathPolylineSegments = useMemo(() => {
-    if (highlightedPath.length === 0) return [];
+    if (highlightedPath.length === 0 || !routeGraph) return [];
+
+    // Find path using A* to get proper segments
+    if (selectedFrom === -1 || selectedTo === -1) return [];
+    
+    const startNodeId = `point-${selectedFrom}`;
+    const endNodeId = `point-${selectedTo}`;
+    
+    const result = findPathAStar(routeGraph, startNodeId, endNodeId);
+    if (!result) return [];
 
     const segments: Array<{
       positions: [number, number][],
@@ -390,97 +853,42 @@ export default function App() {
       label: string
     }> = [];
 
-    for (let i = 0; i < highlightedPath.length - 1; i++) {
-      const fromIdx = highlightedPath[i];
-      const toIdx = highlightedPath[i + 1];
-      const fromData = analysis.pointsData[fromIdx];
-      const toData = analysis.pointsData[toIdx];
-
-      let positions: [number, number][] = [];
-      let distanceKm = 0;
-      let isOffRoadSegment = false;
-
-      // Check if either point is off-road
-      if (fromData.isOffRoad || toData.isOffRoad) {
-        // Direct connection for off-road segments
-        positions = [fromData.point, toData.point];
-        distanceKm = calculateDistance(fromData.point, toData.point);
-        isOffRoadSegment = true;
-      } else {
-        // Both are on-road, find route segment between them
-        const fromRoutePoint = fromData.nearestPoint;
-        const toRoutePoint = toData.nearestPoint;
-
-        if (fromRoutePoint && toRoutePoint && routePath.length > 0) {
-          // Find indices on route
-          let fromRouteIdx = -1;
-          let toRouteIdx = -1;
-          let minDistFrom = Infinity;
-          let minDistTo = Infinity;
-
-          routePath.forEach((p, idx) => {
-            const distFrom = turf.distance(
-              turf.point([p[1], p[0]]),
-              turf.point([fromRoutePoint[1], fromRoutePoint[0]]),
-              { units: 'meters' }
-            );
-            const distTo = turf.distance(
-              turf.point([p[1], p[0]]),
-              turf.point([toRoutePoint[1], toRoutePoint[0]]),
-              { units: 'meters' }
-            );
-
-            if (distFrom < minDistFrom) {
-              minDistFrom = distFrom;
-              fromRouteIdx = idx;
-            }
-            if (distTo < minDistTo) {
-              minDistTo = distTo;
-              toRouteIdx = idx;
-            }
-          });
-
-          if (fromRouteIdx !== -1 && toRouteIdx !== -1) {
-            const startIdx = Math.min(fromRouteIdx, toRouteIdx);
-            const endIdx = Math.max(fromRouteIdx, toRouteIdx);
-            positions = routePath.slice(startIdx, endIdx + 1);
-
-            // Calculate distance along route
-            for (let j = 0; j < positions.length - 1; j++) {
-              distanceKm += turf.distance(
-                turf.point([positions[j][1], positions[j][0]]),
-                turf.point([positions[j + 1][1], positions[j + 1][0]]),
-                { units: 'kilometers' }
-              );
-            }
-          } else {
-            // Fallback to direct distance
-            positions = [fromData.point, toData.point];
-            distanceKm = calculateDistance(fromData.point, toData.point);
-          }
-        } else {
-          // No route available, use direct distance
-          positions = [fromData.point, toData.point];
-          distanceKm = calculateDistance(fromData.point, toData.point);
-        }
-      }
+    result.edges.forEach((edge, idx) => {
+      const fromNode = routeGraph.nodes.get(edge.from);
+      const toNode = routeGraph.nodes.get(edge.to);
+      
+      const isOffRoadSegment = edge.type === 'off-road' || edge.type === 'virtual';
+      const distanceKm = edge.weight / 1000;
 
       segments.push({
-        positions,
+        positions: edge.positions,
         color: isOffRoadSegment ? "#ef4444" : "#10b981",
         isOffRoad: isOffRoadSegment,
         dashArray: isOffRoadSegment ? "5, 10" : undefined,
-        fromIdx,
-        toIdx,
+        fromIdx: fromNode?.pointIndex ?? -1,
+        toIdx: toNode?.pointIndex ?? -1,
         distance: distanceKm,
-        label: `${fromData.label} → ${toData.label}: ${(distanceKm * 1000).toFixed(0)}m ${isOffRoadSegment ? '(Off-road)' : '(On-road)'}`
+        label: `Segment ${idx + 1}: ${edge.weight.toFixed(0)}m ${edge.type === 'off-road' ? '(Off-road)' : edge.type === 'virtual' ? '(Connection)' : '(On-road)'}`
       });
-    }
+    });
 
     return segments;
-  }, [highlightedPath, analysis.pointsData, routePath]);
+  }, [highlightedPath, routeGraph, selectedFrom, selectedTo]);
 
-  // Find path between two points
+  // Build graph whenever analysis changes
+  useEffect(() => {
+    if (analysis.pointsData.length > 0) {
+      const graph = buildRouteGraph(routePath, savedPaths, analysis.pointsData);
+      setRouteGraph(graph);
+      console.log("🔧 Graph built:", {
+        nodes: graph.nodes.size,
+        edges: graph.edges.size,
+        points: analysis.pointsData.length
+      });
+    }
+  }, [analysis.pointsData, routePath, savedPaths]);
+
+  // Find path between two points using A* algorithm
   const handleSearchPath = () => {
     if (selectedFrom === -1 || selectedTo === -1) {
       alert("Please select both From and To points");
@@ -491,6 +899,11 @@ export default function App() {
       return;
     }
 
+    if (!routeGraph) {
+      alert("Graph not built yet. Please calculate route first.");
+      return;
+    }
+
     // Ask for path label
     const pathLabel = prompt("Enter a label for this path:", `Path ${new Date().toLocaleString()}`);
     if (!pathLabel) {
@@ -498,126 +911,283 @@ export default function App() {
       return;
     }
 
-    const fromData = analysis.pointsData[selectedFrom];
-    const toData = analysis.pointsData[selectedTo];
+    // Use A* to find path through the graph
+    const startNodeId = `point-${selectedFrom}`;
+    const endNodeId = `point-${selectedTo}`;
+    
+    console.log("🔍 Finding path from", startNodeId, "to", endNodeId);
+    
+    const result = findPathAStar(routeGraph, startNodeId, endNodeId);
+    
+    if (!result) {
+      alert("No path found between these points. Ensure both points are connected to the network.");
+      return;
+    }
 
-    // Build path considering on-road and off-road points
-    const path: number[] = [];
+    console.log("✅ Path found:", {
+      nodes: result.path.length,
+      edges: result.edges.length,
+      distance: result.distance.toFixed(1) + "m"
+    });
 
-    // Strategy:
-    // 1. If point is off-road, we need to connect it to the road network first
-    // 2. Then route along the road network
-    // 3. Finally connect from road to destination if it's off-road
-
-    // Case 1: From is off-road
-    if (fromData.isOffRoad) {
-      path.push(selectedFrom);
-      // We'll add a virtual connection to the road in the visualization
-      // For now, find the nearest on-road checkpoint to route through
-
-      // Find nearest on-road checkpoint
-      let nearestOnRoadIdx = -1;
-      let minDist = Infinity;
-
-      analysis.pointsData.forEach((data, idx) => {
-        if (!data.isOffRoad && !data.isHouse) {
-          const dist = turf.distance(
-            turf.point([fromData.point[1], fromData.point[0]]),
-            turf.point([data.point[1], data.point[0]]),
-            { units: 'meters' }
-          );
-          if (dist < minDist) {
-            minDist = dist;
-            nearestOnRoadIdx = idx;
-          }
-        }
-      });
-
-      if (nearestOnRoadIdx !== -1) {
-        // Route from nearest on-road checkpoint
-        if (toData.isOffRoad) {
-          // Find nearest on-road checkpoint to destination
-          let nearestToOnRoadIdx = -1;
-          let minDistTo = Infinity;
-
-          analysis.pointsData.forEach((data, idx) => {
-            if (!data.isOffRoad && !data.isHouse) {
-              const dist = turf.distance(
-                turf.point([toData.point[1], toData.point[0]]),
-                turf.point([data.point[1], data.point[0]]),
-                { units: 'meters' }
-              );
-              if (dist < minDistTo) {
-                minDistTo = dist;
-                nearestToOnRoadIdx = idx;
-              }
-            }
-          });
-
-          if (nearestToOnRoadIdx !== -1) {
-            const onRoadPath = findOnRoadPath(nearestOnRoadIdx, nearestToOnRoadIdx);
-            path.push(...onRoadPath);
-            path.push(selectedTo);
-          } else {
-            path.push(selectedTo);
-          }
-        } else {
-          // To is on-road
-          const onRoadPath = findOnRoadPath(nearestOnRoadIdx, selectedTo);
-          path.push(...onRoadPath);
-        }
-      } else {
-        // No on-road checkpoint found, direct connection
-        path.push(selectedTo);
+    // Convert node path to point indices for highlighting
+    const pointPath: number[] = [];
+    result.path.forEach(nodeId => {
+      const node = routeGraph.nodes.get(nodeId);
+      if (node && node.pointIndex !== undefined) {
+        pointPath.push(node.pointIndex);
       }
-    }
-    // Case 2: From is on-road, To is off-road
-    else if (toData.isOffRoad) {
-      path.push(selectedFrom);
+    });
 
-      // Find nearest on-road checkpoint to destination
-      let nearestOnRoadIdx = -1;
-      let minDist = Infinity;
+    setHighlightedPath(pointPath);
 
-      analysis.pointsData.forEach((data, idx) => {
-        if (!data.isOffRoad && !data.isHouse) {
-          const dist = turf.distance(
-            turf.point([toData.point[1], toData.point[0]]),
-            turf.point([data.point[1], data.point[0]]),
-            { units: 'meters' }
-          );
-          if (dist < minDist) {
-            minDist = dist;
-            nearestOnRoadIdx = idx;
-          }
-        }
-      });
-
-      if (nearestOnRoadIdx !== -1 && nearestOnRoadIdx !== selectedFrom) {
-        const onRoadPath = findOnRoadPath(selectedFrom, nearestOnRoadIdx);
-        if (onRoadPath.length > 1) {
-          path.push(...onRoadPath.slice(1));
-        }
-      }
-
-      path.push(selectedTo);
-    }
-    // Case 3: Both are on-road
-    else {
-      const onRoadPath = findOnRoadPath(selectedFrom, selectedTo);
-      path.push(...onRoadPath);
-    }
-
-    setHighlightedPath(path);
-
-    // Save this path to localStorage with the segments from pathPolylineSegments
-    // We need to do this in a setTimeout to wait for pathPolylineSegments to update
+    // Save path segments to storage
     setTimeout(() => {
-      savePathToStorage(path, pathLabel);
+      savePathFromGraph(result.edges, pathLabel);
     }, 100);
   };
 
-  // Save path to localStorage
+  // Handle custom road creation
+  const handleStartRoadCreation = () => {
+    setIsCreatingRoad(true);
+    setCustomRoadPoints([]);
+    alert("Road Creation Mode: Click on the map to add points for your custom road.\n\n✓ Road will automatically connect to nearest existing network\n✓ Click 'Finish Road' when done (minimum 2 points)");
+  };
+
+  const handleCancelRoadCreation = () => {
+    setIsCreatingRoad(false);
+    setCustomRoadPoints([]);
+  };
+
+  const handleFinishRoadCreation = () => {
+    if (customRoadPoints.length < 2) {
+      alert("Please add at least 2 points to create a road.");
+      return;
+    }
+
+    const roadLabel = prompt("Enter a label for this custom road:", `Custom Road ${new Date().toLocaleTimeString()}`);
+    if (!roadLabel) {
+      alert("Road label is required");
+      return;
+    }
+
+    // Calculate total distance
+    let totalDistance = 0;
+    for (let i = 0; i < customRoadPoints.length - 1; i++) {
+      const dist = turf.distance(
+        turf.point([customRoadPoints[i][1], customRoadPoints[i][0]]),
+        turf.point([customRoadPoints[i + 1][1], customRoadPoints[i + 1][0]]),
+        { units: 'meters' }
+      );
+      totalDistance += dist;
+    }
+
+    // Find connection points to existing network - PRIORITIZE MAIN ROUTE
+    const findNearestNetworkPoint = (point: [number, number]) => {
+      const turfPoint = turf.point([point[1], point[0]]);
+      
+      // PRIORITY 1: Try to connect to main route first (if exists)
+      if (routePath.length >= 2) {
+        const routeCoords = routePath.map(p => [p[1], p[0]]);
+        const routeLine = turf.lineString(routeCoords);
+        const nearest = turf.nearestPointOnLine(routeLine, turfPoint);
+        const distance = turf.distance(turfPoint, nearest, { units: 'meters' });
+        
+        // If main route is within reasonable distance, use it
+        if (distance < 1000) { // 1km threshold for main route
+          return {
+            nearestPoint: [
+              nearest.geometry.coordinates[1],
+              nearest.geometry.coordinates[0]
+            ] as [number, number],
+            distance: distance,
+            isMainRoute: true
+          };
+        }
+      }
+      
+      // PRIORITY 2: If no main route or too far, check existing custom roads
+      // Custom roads that are already created become part of the network
+      let minDistance = Infinity;
+      let nearestPoint: [number, number] | null = null;
+      
+      savedPaths.forEach(path => {
+        // Skip connection lines - we want to connect to actual roads
+        if (path.isConnection) return;
+
+        // Include ALL saved paths (including custom roads) as part of the network
+        if (path.positions && path.positions.length >= 2) {
+          const routeCoords = path.positions.map((p: [number, number]) => [p[1], p[0]]);
+          const routeLine = turf.lineString(routeCoords);
+          const nearest = turf.nearestPointOnLine(routeLine, turfPoint);
+          const distance = turf.distance(turfPoint, nearest, { units: 'meters' });
+          
+          if (distance < minDistance) {
+            minDistance = distance;
+            nearestPoint = [
+              nearest.geometry.coordinates[1],
+              nearest.geometry.coordinates[0]
+            ];
+          }
+        }
+      });
+      
+      if (nearestPoint && minDistance < 1000) {
+        return { nearestPoint, distance: minDistance, isMainRoute: false };
+      }
+      
+      return null;
+    };
+
+    // Create the main custom road
+    const newRoad = {
+      id: `custom-road_${Date.now()}_${Math.random()}`,
+      label: roadLabel,
+      from: {
+        point: customRoadPoints[0],
+        label: `${roadLabel} - Start`,
+        index: -1,
+        isHouse: false
+      },
+      to: {
+        point: customRoadPoints[customRoadPoints.length - 1],
+        label: `${roadLabel} - End`,
+        index: -1,
+        isHouse: false
+      },
+      positions: customRoadPoints,
+      isOffRoad: false,
+      distance: totalDistance,
+      color: "#3b82f6",
+      dashArray: undefined,
+      isCustomRoad: true
+    };
+
+    const updatedPaths = [...savedPaths, newRoad];
+
+    // Create connection lines to nearest network points
+    const connectionPaths: any[] = [];
+    
+    // Connect start point
+    const startConnection = findNearestNetworkPoint(customRoadPoints[0]);
+    if (startConnection && startConnection.nearestPoint && startConnection.distance < 1000) {
+      connectionPaths.push({
+        id: `connection_${Date.now()}_start_${Math.random()}`,
+        label: `${roadLabel} - Start Connection`,
+        from: {
+          point: customRoadPoints[0],
+          label: `${roadLabel} - Start`,
+          index: -1,
+          isHouse: false
+        },
+        to: {
+          point: startConnection.nearestPoint,
+          label: 'Network Connection',
+          index: -1,
+          isHouse: false
+        },
+        positions: [customRoadPoints[0], startConnection.nearestPoint],
+        isOffRoad: false,
+        distance: startConnection.distance,
+        color: "#3b82f6",
+        dashArray: "8, 8", // Dotted line
+        isCustomRoad: false,
+        isConnection: true // Flag to identify connection lines
+      });
+    }
+
+    // Connect end point
+    const endConnection = findNearestNetworkPoint(customRoadPoints[customRoadPoints.length - 1]);
+    if (endConnection && endConnection.nearestPoint && endConnection.distance < 1000) {
+      connectionPaths.push({
+        id: `connection_${Date.now()}_end_${Math.random()}`,
+        label: `${roadLabel} - End Connection`,
+        from: {
+          point: customRoadPoints[customRoadPoints.length - 1],
+          label: `${roadLabel} - End`,
+          index: -1,
+          isHouse: false
+        },
+        to: {
+          point: endConnection.nearestPoint,
+          label: 'Network Connection',
+          index: -1,
+          isHouse: false
+        },
+        positions: [customRoadPoints[customRoadPoints.length - 1], endConnection.nearestPoint],
+        isOffRoad: false,
+        distance: endConnection.distance,
+        color: "#3b82f6",
+        dashArray: "8, 8", // Dotted line
+        isCustomRoad: false,
+        isConnection: true
+      });
+    }
+
+    // Save all paths (road + connections)
+    const allNewPaths = [...updatedPaths, ...connectionPaths];
+    setSavedPaths(allNewPaths);
+    localStorage.setItem('roadPaths', JSON.stringify(allNewPaths));
+
+    const connectionMsg = connectionPaths.length > 0 
+      ? `\n${connectionPaths.length} connection${connectionPaths.length > 1 ? 's' : ''} to existing network created.`
+      : '\nNote: No nearby network found for auto-connection.';
+    
+    alert(`Custom road "${roadLabel}" created with ${customRoadPoints.length} points (${totalDistance.toFixed(1)}m)${connectionMsg}`);
+    
+    // Exit road creation mode
+    setIsCreatingRoad(false);
+    setCustomRoadPoints([]);
+  };
+
+  // Save path from graph edges to localStorage
+  const savePathFromGraph = (edges: GraphEdge[], label: string) => {
+    const newPaths: any[] = [];
+
+    edges.forEach((edge, idx) => {
+      // Skip virtual edges for display (they're just for routing)
+      if (edge.type === 'virtual') return;
+
+      const isOffRoadSegment = edge.type === 'off-road';
+
+      newPaths.push({
+        id: `path_${Date.now()}_${idx}_${Math.random()}`,
+        label: label,
+        from: {
+          point: edge.positions[0],
+          label: `Segment ${idx + 1} start`,
+          index: -1,
+          isHouse: false
+        },
+        to: {
+          point: edge.positions[edge.positions.length - 1],
+          label: `Segment ${idx + 1} end`,
+          index: -1,
+          isHouse: false
+        },
+        positions: edge.positions,
+        isOffRoad: isOffRoadSegment,
+        distance: edge.weight,
+        color: isOffRoadSegment ? "#ef4444" : "#22c55e",
+        dashArray: isOffRoadSegment ? "10, 10" : undefined
+      });
+    });
+
+    if (newPaths.length === 0) {
+      alert("No valid path segments to save");
+      return;
+    }
+
+    // Save to state and localStorage
+    const updatedPaths = [...savedPaths, ...newPaths];
+    setSavedPaths(updatedPaths);
+    localStorage.setItem('roadPaths', JSON.stringify(updatedPaths));
+
+    alert(`Saved path "${label}" with ${newPaths.length} segment(s)`);
+  };
+
+  // Legacy save function for compatibility (commented out - now using graph-based approach)
+  /*
   const savePathToStorage = (path: number[], label: string) => {
     const newPaths: any[] = [];
 
@@ -687,19 +1257,28 @@ export default function App() {
 
     alert(`Saved path "${label}" with ${newPaths.length} segment(s)`);
   };
+  */
 
-  // Generate detailed JSON for the path - runs when path or segments change
+  // Generate detailed JSON for the path using graph data
   useEffect(() => {
     if (highlightedPath.length === 0 || pathPolylineSegments.length === 0) {
       setPathJSON(null);
       return;
     }
 
-    if (selectedFrom === -1 || selectedTo === -1) {
+    if (selectedFrom === -1 || selectedTo === -1 || !routeGraph) {
       return;
     }
 
-    const path = highlightedPath;
+    // Use A* to get the actual path with edges
+    const startNodeId = `point-${selectedFrom}`;
+    const endNodeId = `point-${selectedTo}`;
+    const result = findPathAStar(routeGraph, startNodeId, endNodeId);
+    
+    if (!result) {
+      setPathJSON(null);
+      return;
+    }
 
     // Helper to get full point metadata
     const getPointMetadata = (idx: number) => {
@@ -713,13 +1292,13 @@ export default function App() {
         },
         type: point.isHouse ? "house" : "checkpoint",
         status: point.isOffRoad ? "off-road" : "on-road",
+        networkConnection: point.pathType || 'main-route',
         distanceFromRoute: {
           meters: parseFloat(point.distance.toFixed(1)),
           kilometers: parseFloat((point.distance / 1000).toFixed(3))
         }
       };
 
-      // Add house-specific metadata
       if (point.isHouse && point.houseData) {
         metadata.houseDetails = {
           houseNumber: point.houseData.houseNo,
@@ -731,121 +1310,58 @@ export default function App() {
         };
       }
 
-      // Add off-road connection info
-      if (point.isOffRoad && point.connectedToIndex !== -1) {
-        const connectedPoint = analysis.pointsData[point.connectedToIndex];
-        metadata.nearestCheckpoint = {
-          index: point.connectedToIndex,
-          label: connectedPoint.label,
-          type: connectedPoint.isHouse ? "house" : "checkpoint",
-          status: connectedPoint.isOffRoad ? "off-road" : "on-road",
-          connectionDistance: {
-            meters: parseFloat(point.connectionDistance.toFixed(1)),
-            kilometers: parseFloat((point.connectionDistance / 1000).toFixed(3))
-          }
-        };
-
-        // If connected point is a house, include its details
-        if (connectedPoint.isHouse && connectedPoint.houseData) {
-          metadata.nearestCheckpoint.houseDetails = {
-            houseNumber: connectedPoint.houseData.houseNo,
-            ownerName: connectedPoint.houseData.ownerName,
-            roadName: connectedPoint.houseData.roadName,
-            roadCode: connectedPoint.houseData.roadCode
-          };
-        }
-      }
-
       return metadata;
     };
 
     const pathDetails: any = {
       pathId: `path_${Date.now()}`,
       timestamp: new Date().toISOString(),
+      algorithm: "A* (Graph-based)",
       from: getPointMetadata(selectedFrom),
       to: getPointMetadata(selectedTo),
       segments: [],
       totalDistance: {
-        meters: 0,
-        kilometers: 0
+        meters: parseFloat(result.distance.toFixed(1)),
+        kilometers: parseFloat((result.distance / 1000).toFixed(3))
       },
-      totalSegments: path.length - 1,
-      pathType: "mixed" // will be updated
+      totalSegments: result.edges.length,
+      pathType: "graph-optimized"
     };
 
-    let totalDistanceKm = 0;
     let hasOffRoad = false;
     let hasOnRoad = false;
 
-    // Build segments with direction and distance using the same logic as pathPolylineSegments
-    for (let i = 0; i < path.length - 1; i++) {
-      const fromIdx = path[i];
-      const toIdx = path[i + 1];
-      const fromPoint = analysis.pointsData[fromIdx];
-      const toPoint = analysis.pointsData[toIdx];
-
-      // Calculate distance the same way as pathPolylineSegments
-      let distanceKm = 0;
-      const isOffRoadSegment = fromPoint.isOffRoad || toPoint.isOffRoad;
-
-      if (isOffRoadSegment) {
-        // Direct distance for off-road segments
-        distanceKm = calculateDistance(fromPoint.point, toPoint.point);
-      } else {
-        // Use route distance for on-road segments
-        const segment = pathPolylineSegments.find(s =>
-          s.fromIdx === fromIdx && s.toIdx === toIdx
-        );
-        distanceKm = segment ? segment.distance : calculateDistance(fromPoint.point, toPoint.point);
-      }
-
-      const distanceM = distanceKm * 1000;
-      const direction = getDirection(fromPoint.point, toPoint.point);
+    // Build segments from graph edges
+    result.edges.forEach((edge, idx) => {
+      const isOffRoadSegment = edge.type === 'off-road' || edge.type === 'virtual';
+      const distanceM = edge.weight;
+      const distanceKm = edge.weight / 1000;
 
       if (isOffRoadSegment) hasOffRoad = true;
       else hasOnRoad = true;
 
+      const fromPos = edge.positions[0];
+      const toPos = edge.positions[edge.positions.length - 1];
+      const direction = getDirection(fromPos, toPos);
+
       const segment: any = {
-        segmentNumber: i + 1,
-        from: getPointMetadata(fromIdx),
-        to: getPointMetadata(toIdx),
+        segmentNumber: idx + 1,
+        edgeType: edge.type,
         distance: {
           meters: parseFloat(distanceM.toFixed(1)),
           kilometers: parseFloat(distanceKm.toFixed(3))
         },
         direction: direction,
         bearing: parseFloat(turf.bearing(
-          turf.point([fromPoint.point[1], fromPoint.point[0]]),
-          turf.point([toPoint.point[1], toPoint.point[0]])
+          turf.point([fromPos[1], fromPos[0]]),
+          turf.point([toPos[1], toPos[0]])
         ).toFixed(2)),
         roadType: isOffRoadSegment ? "off-road" : "on-road",
-        description: `From ${fromPoint.label} travel ${distanceM.toFixed(0)} meters (${distanceKm.toFixed(2)} km) ${direction.toLowerCase()} to ${toPoint.label}`
+        description: `Travel ${distanceM.toFixed(0)} meters ${direction.toLowerCase()} via ${edge.type} route`
       };
 
-      // Add road information from house data if available
-      const roadInfo: any = {};
-      if (fromPoint.isHouse && fromPoint.houseData) {
-        roadInfo.fromRoad = {
-          name: fromPoint.houseData.roadName,
-          code: fromPoint.houseData.roadCode
-        };
-      }
-      if (toPoint.isHouse && toPoint.houseData) {
-        roadInfo.toRoad = {
-          name: toPoint.houseData.roadName,
-          code: toPoint.houseData.roadCode
-        };
-      }
-      if (Object.keys(roadInfo).length > 0) {
-        segment.roadInformation = roadInfo;
-      }
-
       pathDetails.segments.push(segment);
-      totalDistanceKm += distanceKm;
-    }
-
-    pathDetails.totalDistance.kilometers = parseFloat(totalDistanceKm.toFixed(3));
-    pathDetails.totalDistance.meters = parseFloat((totalDistanceKm * 1000).toFixed(1));
+    });
 
     // Determine path type
     if (hasOffRoad && hasOnRoad) {
@@ -856,12 +1372,13 @@ export default function App() {
       pathDetails.pathType = "on-road";
     }
 
-    pathDetails.summary = `Travel from ${pathDetails.from.label} to ${pathDetails.to.label} covering ${pathDetails.totalDistance.meters} meters (${pathDetails.totalDistance.kilometers} km) through ${pathDetails.totalSegments} segment(s) via ${pathDetails.pathType} route`;
+    pathDetails.summary = `A* path from ${pathDetails.from.label} to ${pathDetails.to.label} covering ${pathDetails.totalDistance.meters} meters (${pathDetails.totalDistance.kilometers} km) through ${pathDetails.totalSegments} segment(s) via ${pathDetails.pathType} route`;
 
     setPathJSON(pathDetails);
-  }, [highlightedPath, pathPolylineSegments, selectedFrom, selectedTo, analysis.pointsData]);
+  }, [highlightedPath, pathPolylineSegments, selectedFrom, selectedTo, analysis.pointsData, routeGraph]);
 
-  // Helper function to find path between on-road points along the route
+  // Legacy helper functions (commented out - now using graph-based A* pathfinding)
+  /*
   const findOnRoadPath = (from: number, to: number): number[] => {
     const fromData = analysis.pointsData[from];
     const toData = analysis.pointsData[to];
@@ -879,11 +1396,10 @@ export default function App() {
       // Find the indices of from and to in the route
       let fromRouteIdx = -1;
       let toRouteIdx = -1;
+      let minDistFrom = Infinity;
+      let minDistTo = Infinity;
 
       if (fromData.nearestPoint && toData.nearestPoint && routePath.length > 0) {
-        let minDistFrom = Infinity;
-        let minDistTo = Infinity;
-
         routePath.forEach((p, idx) => {
           const distFrom = turf.distance(
             turf.point([p[1], p[0]]),
@@ -1018,6 +1534,7 @@ export default function App() {
 
     return [];
   };
+  */
 
   return (
     <div style={{ padding: "20px", fontFamily: "Arial, sans-serif", display: "flex", flexDirection: "column", alignItems: "center" }}>
@@ -1078,15 +1595,16 @@ export default function App() {
                       <>
                         <hr style={{ margin: "8px 0" }} />
                         <span style={{ color: "#ef4444", fontWeight: "bold" }}>
-                          ⚠️ OFF-ROAD: {houseData.distance.toFixed(1)}m from route
+                          ⚠️ OFF-ROAD: {houseData.distance.toFixed(1)}m from network
                         </span><br />
-                        <b>Connection:</b> Connects to road network via dotted line<br />
+                        <b>Network Type:</b> {houseData.pathType === 'off-road-connection' ? 'Off-road path' : 'Main route'}<br />
+                        <b>Connection:</b> Connects to {houseData.pathType === 'off-road-connection' ? 'saved off-road path' : 'main road'} via dotted line<br />
                         <b>Connection Distance:</b> {houseData.connectionDistance.toFixed(1)}m
                       </>
                     ) : (
                       <>
                         <hr style={{ margin: "8px 0" }} />
-                        <span style={{ color: "#22c55e", fontWeight: "bold" }}>✅ ON-ROAD ACCESS</span>
+                        <span style={{ color: "#22c55e", fontWeight: "bold" }}>✅ ON {houseData.pathType === 'off-road-connection' ? 'OFF-ROAD PATH' : 'MAIN ROAD'}</span>
                       </>
                     )
                   ) : "Calculate route to check road access"}
@@ -1115,11 +1633,12 @@ export default function App() {
                 {routePath.length > 0 && checkpointData ? (
                   checkpointData.isOffRoad ? (
                     <>
-                      ⚠️ Off-road: {checkpointData.distance.toFixed(1)}m from route<br />
-                      Connects to road network via dotted line<br />
+                      ⚠️ Off-road: {checkpointData.distance.toFixed(1)}m from network<br />
+                      <b>Network:</b> {checkpointData.pathType === 'off-road-connection' ? 'Saved off-road path' : 'Main route'}<br />
+                      Connects via dotted line<br />
                       Connection Distance: {checkpointData.connectionDistance.toFixed(1)}m
                     </>
-                  ) : `✅ On-road`
+                  ) : `✅ On ${checkpointData.pathType === 'off-road-connection' ? 'off-road path' : 'main road'}`
                 ) : "Calculate to check road status"}
               </Popup>
             </Marker>
@@ -1151,9 +1670,46 @@ export default function App() {
             positions={path.positions}
             color={path.color}
             dashArray={path.dashArray}
-            weight={path.isOffRoad ? 3 : 5}
-            opacity={0.8}
-          />
+            weight={path.isConnection ? 3 : (path.isCustomRoad ? 6 : (path.isOffRoad ? 3 : 5))}
+            opacity={path.isConnection ? 0.6 : (path.isCustomRoad ? 0.9 : 0.8)}
+          >
+            {path.isCustomRoad && (
+              <Tooltip permanent direction="center">
+                🛣️ {path.label}
+              </Tooltip>
+            )}
+            {path.isConnection && (
+              <Tooltip direction="center">
+                🔗 Connection ({path.distance.toFixed(0)}m)
+              </Tooltip>
+            )}
+          </Polyline>
+        ))}
+
+        {/* Connection point markers for better visibility */}
+        {showSavedPaths && savedPaths.filter(p => p.isConnection).map((path) => (
+          <Marker
+            key={`${path.id}-marker`}
+            position={path.to.point}
+            icon={L.divIcon({
+              html: `<div style="
+                background-color: #6366f1;
+                width: 10px;
+                height: 10px;
+                border-radius: 50%;
+                border: 2px solid white;
+                box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+              "></div>`,
+              className: "",
+              iconSize: [10, 10],
+              iconAnchor: [5, 5],
+            })}
+          >
+            <Popup>
+              <b>Network Connection Point</b><br/>
+              Distance: {path.distance.toFixed(1)}m
+            </Popup>
+          </Marker>
         ))}
 
         {/* Route Segments: Only show base route */}
@@ -1183,9 +1739,110 @@ export default function App() {
             </Tooltip>
           </Polyline>
         ))}
+
+        {/* Custom Road Creation - Show temporary points and line */}
+        {isCreatingRoad && customRoadPoints.length > 0 && (
+          <>
+            {/* Show markers for each point */}
+            {customRoadPoints.map((point, idx) => (
+              <Marker
+                key={`custom-road-point-${idx}`}
+                position={point}
+                icon={L.divIcon({
+                  html: `<div style="
+                    background-color: #3b82f6;
+                    color: white;
+                    width: 24px;
+                    height: 24px;
+                    border-radius: 50%;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    border: 3px solid white;
+                    font-weight: bold;
+                    box-shadow: 0 2px 6px rgba(0,0,0,0.4);
+                    font-size: 11px;
+                  ">${idx + 1}</div>`,
+                  className: "",
+                  iconSize: [24, 24],
+                  iconAnchor: [12, 12],
+                })}
+              >
+                <Popup>
+                  <b>Custom Road Point {idx + 1}</b>
+                </Popup>
+              </Marker>
+            ))}
+            {/* Show connecting line */}
+            {customRoadPoints.length > 1 && (
+              <Polyline
+                positions={customRoadPoints}
+                color="#3b82f6"
+                weight={5}
+                opacity={0.8}
+              >
+                <Tooltip permanent direction="center">
+                  Creating Custom Road ({customRoadPoints.length} points)
+                </Tooltip>
+              </Polyline>
+            )}
+          </>
+        )}
       </MapContainer>
 
+      {/* Road Creation Mode Banner */}
+      {isCreatingRoad && (
+        <div style={{
+          margin: "10px 0",
+          padding: "15px",
+          backgroundColor: "#dbeafe",
+          border: "2px solid #3b82f6",
+          borderRadius: "8px",
+          width: "100%",
+          maxWidth: "900px"
+        }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: "10px" }}>
+            <div>
+              <b style={{ color: "#1e40af", fontSize: "16px" }}>🛣️ Custom Road Creation Mode</b>
+              <div style={{ color: "#1e40af", fontSize: "14px", marginTop: "5px" }}>
+                Click on the map to add points • {customRoadPoints.length} point{customRoadPoints.length !== 1 ? 's' : ''} added
+              </div>
+              <div style={{ color: "#1e3a8a", fontSize: "12px", marginTop: "3px", fontStyle: "italic" }}>
+                ℹ️ Road will auto-connect to nearest existing network
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: "10px" }}>
+              <button
+                onClick={handleFinishRoadCreation}
+                disabled={customRoadPoints.length < 2}
+                style={{
+                  ...btnStyle,
+                  backgroundColor: customRoadPoints.length >= 2 ? "#10b981" : "#9ca3af",
+                  cursor: customRoadPoints.length >= 2 ? "pointer" : "not-allowed"
+                }}
+              >
+                ✅ Finish Road
+              </button>
+              <button
+                onClick={handleCancelRoadCreation}
+                style={{ ...btnStyle, backgroundColor: "#ef4444" }}
+              >
+                ❌ Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       <div style={{ margin: "20px 0", display: "flex", gap: "10px", flexWrap: "wrap", alignItems: "center" }}>
+        {!isCreatingRoad && (
+          <button 
+            onClick={handleStartRoadCreation} 
+            style={{ ...btnStyle, backgroundColor: "#3b82f6" }}
+          >
+            🛣️ Create Custom Road
+          </button>
+        )}
         <button onClick={handleCalculate} style={btnStyle}>
           Calculate Route & Road Access
         </button>
@@ -1214,7 +1871,10 @@ export default function App() {
         </button>
         <button
           onClick={() => {
-            if (confirm(`Delete all ${savedPaths.length} saved paths?`)) {
+            const customRoadsCount = savedPaths.filter(p => p.isCustomRoad).length;
+            const otherPathsCount = savedPaths.length - customRoadsCount;
+            const message = `Delete all ${savedPaths.length} saved paths?\n(${customRoadsCount} custom road${customRoadsCount !== 1 ? 's' : ''}, ${otherPathsCount} other path${otherPathsCount !== 1 ? 's' : ''})`;
+            if (confirm(message)) {
               setSavedPaths([]);
               localStorage.removeItem('roadPaths');
               alert('All saved paths deleted');
@@ -1222,9 +1882,67 @@ export default function App() {
           }}
           style={{ ...btnStyle, backgroundColor: "#dc2626" }}
         >
-          🗑️ Clear Saved Paths
+          🗑️ Clear All Paths
         </button>
       </div>
+
+      {/* Network Statistics */}
+      {(routePath.length > 0 || savedPaths.length > 0) && (
+        <div style={{
+          margin: "20px 0",
+          padding: "15px",
+          backgroundColor: "#f0f9ff",
+          borderRadius: "8px",
+          border: "2px solid #0ea5e9",
+          width: "100%",
+          maxWidth: "900px"
+        }}>
+          <h4 style={{ margin: "0 0 10px 0", color: "#0c4a6e" }}>📊 Network Statistics</h4>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: "10px" }}>
+            <div style={{ padding: "10px", backgroundColor: "white", borderRadius: "6px" }}>
+              <div style={{ fontSize: "12px", color: "#64748b", marginBottom: "5px" }}>Main Route Points</div>
+              <div style={{ fontSize: "20px", fontWeight: "bold", color: "#22c55e" }}>
+                {analysis.pointsData.filter(p => !p.isOffRoad && p.pathType !== 'off-road-connection').length}
+              </div>
+            </div>
+            <div style={{ padding: "10px", backgroundColor: "white", borderRadius: "6px" }}>
+              <div style={{ fontSize: "12px", color: "#64748b", marginBottom: "5px" }}>On Off-Road Paths</div>
+              <div style={{ fontSize: "20px", fontWeight: "bold", color: "#8b5cf6" }}>
+                {analysis.pointsData.filter(p => !p.isOffRoad && p.pathType === 'off-road-connection').length}
+              </div>
+            </div>
+            <div style={{ padding: "10px", backgroundColor: "white", borderRadius: "6px" }}>
+              <div style={{ fontSize: "12px", color: "#64748b", marginBottom: "5px" }}>Off-Road Points</div>
+              <div style={{ fontSize: "20px", fontWeight: "bold", color: "#ef4444" }}>
+                {analysis.pointsData.filter(p => p.isOffRoad).length}
+              </div>
+            </div>
+            <div style={{ padding: "10px", backgroundColor: "white", borderRadius: "6px" }}>
+              <div style={{ fontSize: "12px", color: "#64748b", marginBottom: "5px" }}>Custom Roads</div>
+              <div style={{ fontSize: "20px", fontWeight: "bold", color: "#3b82f6" }}>
+                {savedPaths.filter(p => p.isCustomRoad).length}
+              </div>
+            </div>
+            <div style={{ padding: "10px", backgroundColor: "white", borderRadius: "6px" }}>
+              <div style={{ fontSize: "12px", color: "#64748b", marginBottom: "5px" }}>Network Connections</div>
+              <div style={{ fontSize: "20px", fontWeight: "bold", color: "#6366f1" }}>
+                {savedPaths.filter(p => p.isConnection).length}
+              </div>
+            </div>
+            <div style={{ padding: "10px", backgroundColor: "white", borderRadius: "6px" }}>
+              <div style={{ fontSize: "12px", color: "#64748b", marginBottom: "5px" }}>Total Saved Paths</div>
+              <div style={{ fontSize: "20px", fontWeight: "bold", color: "#0ea5e9" }}>
+                {savedPaths.length}
+              </div>
+            </div>
+          </div>
+          <div style={{ marginTop: "10px", padding: "10px", backgroundColor: "white", borderRadius: "6px" }}>
+            <div style={{ fontSize: "12px", color: "#64748b" }}>
+              💡 Tip: Custom roads auto-connect to the network with dotted lines for complete routing!
+            </div>
+          </div>
+        </div>
+      )}
 
 
 
@@ -1389,7 +2107,7 @@ const btnStyle = {
   fontWeight: "bold" as const
 };
 
-const tdStyle = {
-  padding: "12px",
-  borderBottom: "1px solid #ddd"
-};
+// const tdStyle = {
+//   padding: "12px",
+//   borderBottom: "1px solid #ddd"
+// };
