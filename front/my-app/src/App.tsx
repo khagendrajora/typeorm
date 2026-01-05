@@ -1712,8 +1712,8 @@ export default function App() {
           </Marker>
         ))}
 
-        {/* Route Segments: Only show base route */}
-        {analysis.polylineSegments.map((segment, idx) => (
+        {/* Route Segments: REMOVED - Now available as JSON */}
+        {/* {analysis.polylineSegments.map((segment, idx) => (
           <Polyline
             key={`segment-${idx}`}
             positions={segment.positions}
@@ -1722,10 +1722,10 @@ export default function App() {
             weight={segment.isOffRoad ? 3 : 5}
             opacity={0.6}
           />
-        ))}
+        ))} */}
 
-        {/* Highlighted Path Segments with Labels - Only shown when path is selected */}
-        {pathPolylineSegments.map((segment, idx) => (
+        {/* Highlighted Path Segments with Labels - REMOVED - Now available as JSON */}
+        {/* {pathPolylineSegments.map((segment, idx) => (
           <Polyline
             key={`path-segment-${idx}`}
             positions={segment.positions}
@@ -1738,7 +1738,7 @@ export default function App() {
               {segment.label}
             </Tooltip>
           </Polyline>
-        ))}
+        ))} */}
 
         {/* Custom Road Creation - Show temporary points and line */}
         {isCreatingRoad && customRoadPoints.length > 0 && (
@@ -1940,6 +1940,142 @@ export default function App() {
             <div style={{ fontSize: "12px", color: "#64748b" }}>
               💡 Tip: Custom roads auto-connect to the network with dotted lines for complete routing!
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Segments JSON Export Section */}
+      {analysis.polylineSegments.length > 0 && (
+        <div style={{
+          margin: "20px 0",
+          padding: "20px",
+          backgroundColor: "#fef3c7",
+          borderRadius: "12px",
+          border: "2px solid #f59e0b",
+          width: "100%",
+          maxWidth: "900px"
+        }}>
+          <h3 style={{ margin: "0 0 15px 0", color: "#78350f" }}>📊 Route Segments (JSON)</h3>
+          <div style={{ marginBottom: "15px" }}>
+            <p style={{ margin: "0 0 10px 0", fontSize: "14px", color: "#78350f" }}>
+              <b>Total Segments:</b> {analysis.polylineSegments.length} | 
+              <b> On-Road:</b> {analysis.polylineSegments.filter(s => !s.isOffRoad).length} | 
+              <b> Off-Road:</b> {analysis.polylineSegments.filter(s => s.isOffRoad).length}
+            </p>
+            <div style={{ display: "flex", gap: "10px", flexWrap: "wrap" }}>
+              <button
+                onClick={() => {
+                  const segmentsJSON = {
+                    metadata: {
+                      timestamp: new Date().toISOString(),
+                      totalSegments: analysis.polylineSegments.length,
+                      onRoadSegments: analysis.polylineSegments.filter(s => !s.isOffRoad).length,
+                      offRoadSegments: analysis.polylineSegments.filter(s => s.isOffRoad).length,
+                      totalOnRoadKm: analysis.totalOnRoadKm,
+                      totalOffRoadKm: analysis.totalOffRoadKm,
+                      totalDistanceKm: analysis.totalDistanceKm
+                    },
+                    segments: analysis.polylineSegments.map((seg, idx) => ({
+                      segmentNumber: idx + 1,
+                      fromPointIndex: seg.fromIdx + 1,
+                      toPointIndex: seg.toIdx + 1,
+                      type: seg.isOffRoad ? "off-road" : "on-road",
+                      distanceKm: seg.distance,
+                      distanceMeters: seg.distance * 1000,
+                      color: seg.color,
+                      positions: seg.positions.map(pos => ({
+                        latitude: pos[0],
+                        longitude: pos[1]
+                      }))
+                    }))
+                  };
+                  const dataStr = JSON.stringify(segmentsJSON, null, 2);
+                  const dataBlob = new Blob([dataStr], { type: 'application/json' });
+                  const url = URL.createObjectURL(dataBlob);
+                  const link = document.createElement('a');
+                  link.href = url;
+                  link.download = `route_segments_${Date.now()}.json`;
+                  link.click();
+                  URL.revokeObjectURL(url);
+                }}
+                style={{ ...btnStyle, backgroundColor: "#f59e0b", margin: "0" }}
+              >
+                📥 Download Segments JSON
+              </button>
+              <button
+                onClick={() => {
+                  const segmentsJSON = {
+                    metadata: {
+                      timestamp: new Date().toISOString(),
+                      totalSegments: analysis.polylineSegments.length,
+                      onRoadSegments: analysis.polylineSegments.filter(s => !s.isOffRoad).length,
+                      offRoadSegments: analysis.polylineSegments.filter(s => s.isOffRoad).length,
+                      totalOnRoadKm: analysis.totalOnRoadKm,
+                      totalOffRoadKm: analysis.totalOffRoadKm,
+                      totalDistanceKm: analysis.totalDistanceKm
+                    },
+                    segments: analysis.polylineSegments.map((seg, idx) => ({
+                      segmentNumber: idx + 1,
+                      fromPointIndex: seg.fromIdx + 1,
+                      toPointIndex: seg.toIdx + 1,
+                      type: seg.isOffRoad ? "off-road" : "on-road",
+                      distanceKm: seg.distance,
+                      distanceMeters: seg.distance * 1000,
+                      color: seg.color,
+                      positions: seg.positions.map(pos => ({
+                        latitude: pos[0],
+                        longitude: pos[1]
+                      }))
+                    }))
+                  };
+                  navigator.clipboard.writeText(JSON.stringify(segmentsJSON, null, 2));
+                  alert("Segments JSON copied to clipboard!");
+                }}
+                style={{ ...btnStyle, backgroundColor: "#d97706", margin: "0" }}
+              >
+                📋 Copy Segments JSON
+              </button>
+            </div>
+          </div>
+          <div style={{ 
+            maxHeight: "300px", 
+            overflow: "auto", 
+            backgroundColor: "#1e293b", 
+            padding: "15px", 
+            borderRadius: "8px" 
+          }}>
+            <pre style={{
+              margin: "0",
+              fontSize: "11px",
+              color: "#e2e8f0",
+              whiteSpace: "pre-wrap",
+              wordWrap: "break-word"
+            }}>
+              {JSON.stringify({
+                metadata: {
+                  timestamp: new Date().toISOString(),
+                  totalSegments: analysis.polylineSegments.length,
+                  onRoadSegments: analysis.polylineSegments.filter(s => !s.isOffRoad).length,
+                  offRoadSegments: analysis.polylineSegments.filter(s => s.isOffRoad).length,
+                  totalOnRoadKm: analysis.totalOnRoadKm,
+                  totalOffRoadKm: analysis.totalOffRoadKm,
+                  totalDistanceKm: analysis.totalDistanceKm
+                },
+                segments: analysis.polylineSegments.map((seg, idx) => ({
+                  segmentNumber: idx + 1,
+                  fromPointIndex: seg.fromIdx + 1,
+                  toPointIndex: seg.toIdx + 1,
+                  type: seg.isOffRoad ? "off-road" : "on-road",
+                  distanceKm: seg.distance,
+                  distanceMeters: seg.distance * 1000,
+                  color: seg.color,
+                  positions: seg.positions.map(pos => ({
+                    latitude: pos[0],
+                    longitude: pos[1]
+                  }))
+                }))
+              }, null, 2)}
+            </pre>
           </div>
         </div>
       )}
